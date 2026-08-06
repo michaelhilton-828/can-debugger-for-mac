@@ -25,8 +25,8 @@ class MainWindow(QMainWindow):
         self.browser_tab = BrowserTab()
         self.compare_tab = CompareTab()
         self.log_replay_tab = LogReplayTab()
-        self.tabs.addTab(self.browser_tab, "Browse")
-        self.tabs.addTab(self.compare_tab, "Compare")
+        self.tabs.addTab(self.browser_tab, "DBC Viewer")
+        self.tabs.addTab(self.compare_tab, "DBC Compare")
         self.tabs.addTab(self.log_replay_tab, "Log Replay")
         self.setCentralWidget(self.tabs)
 

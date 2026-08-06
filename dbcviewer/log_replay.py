@@ -8,7 +8,7 @@ embedded directly in the tab via matplotlib's Qt canvas.
 
 from __future__ import annotations
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -59,7 +59,7 @@ class LogReplayTab(QWidget):
         self.dbc_label.setStyleSheet("color: #555;")
         self.dbc_open_button = QPushButton("Open .dbc…")
         self.dbc_open_button.clicked.connect(self._open_dbc_dialog)
-        self.dbc_use_browser_button = QPushButton("Use Browse tab's DBC")
+        self.dbc_use_browser_button = QPushButton("Use DBC Viewer tab's DBC")
         self.dbc_use_browser_button.clicked.connect(self._use_browser_dbc)
         self.dbc_use_browser_button.setEnabled(False)
         dbc_row.addWidget(self.dbc_label, 1)
@@ -114,6 +114,8 @@ class LogReplayTab(QWidget):
 
         self.figure = Figure()
         self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        right_layout.addWidget(self.toolbar)
         right_layout.addWidget(self.canvas, 1)
         splitter.addWidget(right)
 
@@ -146,7 +148,7 @@ class LogReplayTab(QWidget):
         elif self._using_independent_dbc:
             self.dbc_label.setText(f"{self._independent_dbc_path} (independent)")
         else:
-            self.dbc_label.setText(f"{self._browser_database_path} (from Browse tab)")
+            self.dbc_label.setText(f"{self._browser_database_path} (from DBC Viewer tab)")
 
     def _open_dbc_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
