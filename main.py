@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget
 
 from dbcviewer.browser import BrowserTab
 from dbcviewer.compare import CompareTab
+from dbcviewer.log_replay import LogReplayTab
 
 
 class MainWindow(QMainWindow):
@@ -23,9 +24,13 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.browser_tab = BrowserTab()
         self.compare_tab = CompareTab()
+        self.log_replay_tab = LogReplayTab()
         self.tabs.addTab(self.browser_tab, "Browse")
         self.tabs.addTab(self.compare_tab, "Compare")
+        self.tabs.addTab(self.log_replay_tab, "Log Replay")
         self.setCentralWidget(self.tabs)
+
+        self.browser_tab.database_loaded.connect(self.log_replay_tab.set_browser_database)
 
         self._build_menu()
 

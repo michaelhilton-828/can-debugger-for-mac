@@ -5,6 +5,7 @@ build/
 dist/
 .DS_Store
 
-# Real-world .dbc files may contain proprietary vehicle data; keep them local.
+# Real-world .dbc/log files may contain proprietary vehicle data; keep them local.
 # (Synthetic fixtures under samples/ are intentionally tracked.)
 /*.dbc
+/*.blf

@@ -4,7 +4,7 @@ and the bit-layout diagram for the selected message.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -33,6 +33,8 @@ SIGNAL_HEADERS = [
 
 
 class BrowserTab(QWidget):
+    database_loaded = Signal(object, str)  # (cantools Database, file path)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.database = None
@@ -157,6 +159,7 @@ class BrowserTab(QWidget):
         self.message_table.clearSelection()
         if self.message_table.rowCount() > 0:
             self.message_table.selectRow(0)
+        self.database_loaded.emit(database, path)
         return True
 
     # ------------------------------------------------------------ messages
