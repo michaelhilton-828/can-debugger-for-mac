@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget
 
 from dbcviewer.browser import BrowserTab
 from dbcviewer.compare import CompareTab
+from dbcviewer.live_signal import LiveSignalViewerTab
 from dbcviewer.log_replay import LogReplayTab
 
 
@@ -25,12 +26,15 @@ class MainWindow(QMainWindow):
         self.browser_tab = BrowserTab()
         self.compare_tab = CompareTab()
         self.log_replay_tab = LogReplayTab()
+        self.live_signal_tab = LiveSignalViewerTab()
         self.tabs.addTab(self.browser_tab, "DBC Viewer")
         self.tabs.addTab(self.compare_tab, "DBC Compare")
         self.tabs.addTab(self.log_replay_tab, "Log Replay")
+        self.tabs.addTab(self.live_signal_tab, "Live Signal Viewer")
         self.setCentralWidget(self.tabs)
 
         self.browser_tab.database_loaded.connect(self.log_replay_tab.set_browser_database)
+        self.browser_tab.database_loaded.connect(self.live_signal_tab.set_browser_database)
 
         self._build_menu()
 
@@ -62,6 +66,10 @@ class MainWindow(QMainWindow):
         if path.lower().endswith(".dbc"):
             self.tabs.setCurrentWidget(self.browser_tab)
             self.browser_tab.load_file(path)
+
+    def closeEvent(self, event):
+        self.live_signal_tab.shutdown()
+        super().closeEvent(event)
 
 
 def main():

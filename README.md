@@ -1,29 +1,44 @@
 # DBC Viewer
 
-A simple desktop GUI for browsing CAN `.dbc` files. Read-only — it parses and
-displays message/signal structure, it doesn't decode live traffic or log files.
+A desktop GUI for working with CAN `.dbc` files: browse message/signal
+structure, compare two `.dbc` files, replay a logged CAN capture against a
+`.dbc`, and view live CAN/CAN-FD traffic from a PEAK PCAN-USB adapter.
 
 ## Features
 
-- **Open a `.dbc` file** via a file picker, or drag-and-drop onto the window
-- **Message list** — name, CAN ID (hex/dec), DLC, transmitting node(s)
-- **Signal list** — start bit, length, byte order, sign, factor, offset,
-  min/max, unit
-- **Value tables** — enum labels (e.g. `0 = Off`, `1 = On`) for signals that
-  define them
-- **Bit-layout diagram** — a per-message grid showing which bits each signal
-  occupies, so gaps and overlaps are visible at a glance
-- **Search/filter** — filter the message list by name or ID, and the signal
-  list by name
-- **Compare mode** — load a second `.dbc` and see a side-by-side diff:
+- **DBC Viewer tab** — open a `.dbc` file via a file picker or drag-and-drop:
+  - **Message list** — name, CAN ID (hex/dec), DLC, transmitting node(s)
+  - **Signal list** — start bit, length, byte order, sign, factor, offset,
+    min/max, unit
+  - **Value tables** — enum labels (e.g. `0 = Off`, `1 = On`) for signals that
+    define them
+  - **Bit-layout diagram** — a per-message grid showing which bits each
+    signal occupies, so gaps and overlaps are visible at a glance
+  - **Search/filter** — filter the message list by name or ID, and the
+    signal list by name
+- **DBC Compare tab** — load a second `.dbc` and see a side-by-side diff:
   messages/signals added, removed, or changed (ID, DLC, node, bit layout,
   scaling, value tables, etc.)
+- **Log Replay tab** — decode a CAN log file (any format `python-can`
+  supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) against a
+  `.dbc` and plot selected signals, with pan/zoom/reset on the plot
+- **Live Signal Viewer tab** — connect to a PEAK PCAN-USB (FD) adapter over
+  USB, decode live classic-CAN or CAN-FD traffic against a `.dbc`, and plot
+  selected signals in real time over a scrolling time window
+
+The DBC Compare, Log Replay, and Live Signal Viewer tabs all default to
+sharing whatever `.dbc` is currently loaded in the DBC Viewer tab, but can
+each load an independent one instead.
 
 ## Requirements
 
 - Python 3.9+
-- [PySide6](https://pypi.org/project/PySide6/) and
-  [cantools](https://pypi.org/project/cantools/) (see `requirements.txt`)
+- [PySide6](https://pypi.org/project/PySide6/), [cantools](https://pypi.org/project/cantools/),
+  [python-can](https://pypi.org/project/python-can/), [matplotlib](https://pypi.org/project/matplotlib/),
+  and [uptime](https://pypi.org/project/uptime/) (see `requirements.txt`)
+- For the Live Signal Viewer tab on macOS: [MacCAN's PCBUSB library](https://github.com/mac-can/PCBUSB-Library),
+  a separate system-level driver install for PEAK PCAN adapters (PEAK ships
+  no native macOS driver). Not needed for any other tab.
 
 ## Setup
 
@@ -55,12 +70,17 @@ Python installed.
 ## Project layout
 
 ```
-main.py             entry point / main window
+main.py                    entry point / main window
 dbcviewer/
-  dbc_model.py       cantools wrapper, bit-position math
-  browser.py         message/signal browser tab
-  bitlayout.py       bit-layout diagram widget
-  compare.py         two-file compare tab
-  diff.py            diff engine (message/signal comparison)
-samples/             small sample .dbc files for testing
+  dbc_model.py             cantools wrapper, bit-position math
+  browser.py               DBC Viewer tab (message/signal browser)
+  bitlayout.py             bit-layout diagram widget
+  compare.py               DBC Compare tab (two-file diff)
+  diff.py                  diff engine (message/signal comparison)
+  log_replay_model.py      log-file decode logic (Qt-free)
+  log_replay.py            Log Replay tab
+  live_capture_model.py    live-capture decode/buffering logic (Qt-free)
+  live_capture_worker.py   background CAN receive thread
+  live_signal.py           Live Signal Viewer tab
+samples/                    small sample .dbc files for testing
 ```

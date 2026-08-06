@@ -2,3 +2,4 @@ PySide6==6.10.3
 cantools==40.7.1
 python-can==4.6.1
 matplotlib==3.9.4
+uptime==3.0.1
