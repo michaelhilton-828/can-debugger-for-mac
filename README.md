@@ -67,6 +67,19 @@ python3 -m venv .venv
 This produces `dist/DBC Viewer.app`, which runs standalone without needing
 Python installed.
 
+## Updating the installed app (macOS)
+
+After pulling or making code changes, rebuild and reinstall the standalone
+app in one step:
+
+```bash
+./update.sh
+```
+
+This syncs dependencies, quits the running "DBC Viewer" app (if open),
+rebuilds it with PyInstaller, replaces `/Applications/DBC Viewer.app` with
+the new build, and relaunches it.
+
 ## Project layout
 
 ```
