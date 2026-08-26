@@ -203,7 +203,7 @@ class LogReplayTab(QWidget):
         message_count = len({s.message_name for s in signals.values()})
         status = f"Decoded {len(signals)} signal(s) from {message_count} message(s)."
         if unmapped_ids:
-            status += f" {len(unmapped_ids)} unmapped ID(s) skipped."
+            status += f" {len(unmapped_ids)} unmapped ID(s) shown as \"Unknown\"."
         self.status_label.setText(status)
         self._redraw()
 

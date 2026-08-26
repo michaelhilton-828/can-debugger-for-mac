@@ -35,6 +35,8 @@ class SignalSeries:
 
     @property
     def display_label(self) -> str:
+        if self.signal_name == "Unknown":
+            return f"Unknown (0x{self.arbitration_id:X})"
         return f"{self.signal_name} [{self.unit}]" if self.unit else self.signal_name
 
 
@@ -43,9 +45,14 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
 
     Uses can.LogReader, which dispatches to the right reader by file
     extension (see supported_log_extensions()) - so any format python-can
-    supports works here, not just Vector .blf. Frames with no matching
-    message, or that individually fail to decode, are skipped (the DBC is
-    often a partial match for a log); only file-open/parse failures raise.
+    supports works here, not just Vector .blf. Frames whose arbitration ID
+    has no matching message get one "Unknown" entry per ID instead of being
+    dropped, so unmapped traffic is still visible in the signal list (with
+    message/signal/unit shown as "Unknown"/"unknown" and the raw payload,
+    interpreted as a big-endian integer, standing in for a decoded value).
+    Frames that match a message but individually fail to decode are still
+    skipped (the DBC is often a partial match for a log); only
+    file-open/parse failures raise.
 
     Returns (signals, unmapped_ids), where unmapped_ids is the set of
     arbitration IDs seen in the log with no matching message in `database`.
@@ -66,6 +73,18 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
                     dbc_msg = database.get_message_by_frame_id(msg.arbitration_id)
                 except KeyError:
                     unmapped_ids.add(msg.arbitration_id)
+                    key = ("Unknown", f"id_{msg.arbitration_id}")
+                    entry = signals.get(key)
+                    if entry is None:
+                        entry = SignalSeries(
+                            message_name="Unknown",
+                            signal_name="Unknown",
+                            arbitration_id=msg.arbitration_id,
+                            unit="unknown",
+                        )
+                        signals[key] = entry
+                    entry.times.append(msg.timestamp)
+                    entry.values.append(int.from_bytes(bytes(msg.data), "big") if msg.data else 0)
                     continue
                 try:
                     decoded = dbc_msg.decode(msg.data, decode_choices=True, allow_truncated=True)
