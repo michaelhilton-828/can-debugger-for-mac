@@ -20,15 +20,28 @@ structure, compare two `.dbc` files, replay a logged CAN capture against a
   messages/signals added, removed, or changed (ID, DLC, node, bit layout,
   scaling, value tables, etc.)
 - **Log Replay tab** — decode a CAN log file (any format `python-can`
-  supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) against a
-  `.dbc` and plot selected signals, with pan/zoom/reset on the plot
+  supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) and plot
+  selected signals, with pan/zoom/reset on the plot:
+  - **Two DBC slots** — a bus is often described by one `.dbc` per sending
+    node, so the tab decodes against up to two of them at once. Slot 1
+    defaults to the DBC Viewer tab's file; slot 2 is picked here. Either slot
+    can be left empty, and a `DBC` column shows which file each signal came
+    from (so you can also filter the signal list by source).
+  - **Frame-ID overlap handling** — a CAN ID that both files define
+    *identically* is decoded once. One they define *differently* is decoded
+    under **both** interpretations, giving two labelled series plus a warning
+    on the status line, so you can see which reading is plausible rather
+    than having one silently win.
+  - IDs that no loaded `.dbc` describes are still listed as `Unknown` with
+    their raw payload, so unmapped traffic stays visible
 - **Live Signal Viewer tab** — connect to a PEAK PCAN-USB (FD) adapter over
   USB, decode live classic-CAN or CAN-FD traffic against a `.dbc`, and plot
   selected signals in real time over a scrolling time window
 
 The DBC Compare, Log Replay, and Live Signal Viewer tabs all default to
 sharing whatever `.dbc` is currently loaded in the DBC Viewer tab, but can
-each load an independent one instead.
+each load an independent one instead (for Log Replay this applies to DBC
+slot 1; slot 2 is always chosen in the tab).
 
 ## Requirements
 
@@ -90,7 +103,7 @@ dbcviewer/
   bitlayout.py             bit-layout diagram widget
   compare.py               DBC Compare tab (two-file diff)
   diff.py                  diff engine (message/signal comparison)
-  log_replay_model.py      log-file decode logic (Qt-free)
+  log_replay_model.py      log-file decode logic, multi-DBC (Qt-free)
   log_replay.py            Log Replay tab
   live_capture_model.py    live-capture decode/buffering logic (Qt-free)
   live_capture_worker.py   background CAN receive thread
