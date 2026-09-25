@@ -4,7 +4,7 @@ and the bit-layout diagram for the selected message.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -40,6 +42,8 @@ class BrowserTab(QWidget):
         self.database = None
         self.message_rows = []
         self.current_signal_rows = []
+        self._pending_signal_name: str | None = None
+        self._preserving_signal_filter = False
 
         self._build_ui()
 
@@ -78,6 +82,10 @@ class BrowserTab(QWidget):
         self.message_table.itemSelectionChanged.connect(self._on_message_selected)
         self.message_table.setSortingEnabled(True)
         left_layout.addWidget(self.message_table, 1)
+        self.message_detail = QLabel("Cycle time, receivers, and comment appear here.")
+        self.message_detail.setWordWrap(True)
+        self.message_detail.setStyleSheet("color: #333;")
+        left_layout.addWidget(self.message_detail)
         splitter.addWidget(left)
 
         # --- right: signals + values + bit layout ------------------------
@@ -87,9 +95,15 @@ class BrowserTab(QWidget):
         signals_layout = QVBoxLayout(signals_box)
         signals_layout.setContentsMargins(0, 0, 0, 0)
         self.signal_search = QLineEdit()
-        self.signal_search.setPlaceholderText("Filter signals by name…")
-        self.signal_search.textChanged.connect(self._filter_signals)
+        self.signal_search.setPlaceholderText("Find a signal in this DBC…")
+        self.signal_search.textChanged.connect(self._on_signal_query_changed)
+        self.signal_search.returnPressed.connect(self._activate_signal_query)
         signals_layout.addWidget(self.signal_search)
+        self.signal_hits = QListWidget()
+        self.signal_hits.setMaximumHeight(120)
+        self.signal_hits.hide()
+        self.signal_hits.itemClicked.connect(self._jump_to_signal_hit)
+        signals_layout.addWidget(self.signal_hits)
 
         self.signal_table = QTableWidget(0, len(SIGNAL_HEADERS))
         self.signal_table.setHorizontalHeaderLabels(SIGNAL_HEADERS)
@@ -105,7 +119,12 @@ class BrowserTab(QWidget):
         values_layout = QVBoxLayout(values_box)
         values_layout.setContentsMargins(0, 0, 0, 0)
         self.values_label = QLabel("Value table: (select a signal)")
+        self.values_label.setWordWrap(True)
         values_layout.addWidget(self.values_label)
+        self.signal_meta = QLabel("")
+        self.signal_meta.setWordWrap(True)
+        self.signal_meta.setStyleSheet("color: #333;")
+        values_layout.addWidget(self.signal_meta)
         self.values_table = QTableWidget(0, 2)
         self.values_table.setHorizontalHeaderLabels(["Raw value", "Label"])
         self.values_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -122,6 +141,7 @@ class BrowserTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.bit_layout = BitLayoutWidget()
+        self.bit_layout.signal_clicked.connect(self._select_signal_by_name)
         scroll.setWidget(self.bit_layout)
         bitlayout_layout.addWidget(scroll, 1)
         right_splitter.addWidget(bitlayout_box)
@@ -152,14 +172,45 @@ class BrowserTab(QWidget):
         self.path_label.setText(path)
         self.message_rows = message_rows(database)
         self.message_search.clear()
+        self.signal_search.clear()
         self._populate_messages()
         self.current_signal_rows = []
         self._populate_signals([])
         self.bit_layout.set_message(0, [])
+        self.message_detail.setText("")
         self.message_table.clearSelection()
         if self.message_table.rowCount() > 0:
             self.message_table.selectRow(0)
         self.database_loaded.emit(database, path)
+        return True
+
+    def show_message(self, name: str, signal_name: str | None = None, *, keep_query: bool = False) -> bool:
+        """Select `name` (and optionally one of its signals). Returns False if
+        the message is not in the loaded database.
+
+        keep_query leaves the DBC-wide search text in place (used when the
+        user picks a hit from that search).
+        """
+        msg_idx = next((i for i, row in enumerate(self.message_rows) if row.name == name), None)
+        if msg_idx is None:
+            return False
+        visual = self._visual_row_for_message(msg_idx)
+        if visual is None:
+            return False
+        self.message_table.setRowHidden(visual, False)
+        self._pending_signal_name = signal_name or None
+        self._preserving_signal_filter = bool(signal_name) or keep_query
+        if signal_name and not keep_query:
+            self.signal_search.blockSignals(True)
+            self.signal_search.setText(signal_name)
+            self.signal_search.blockSignals(False)
+        self.message_table.blockSignals(True)
+        self.message_table.selectRow(visual)
+        self.message_table.blockSignals(False)
+        item = self.message_table.item(visual, 0)
+        if item is not None:
+            self.message_table.scrollToItem(item)
+        self._on_message_selected()
         return True
 
     # ------------------------------------------------------------ messages
@@ -186,22 +237,52 @@ class BrowserTab(QWidget):
             haystack = f"{row.name} {row.id_hex} {row.frame_id}".lower()
             self.message_table.setRowHidden(r, text not in haystack)
 
+    def _visual_row_for_message(self, msg_idx: int) -> int | None:
+        for r in range(self.message_table.rowCount()):
+            item = self.message_table.item(r, 0)
+            if item is not None and item.data(Qt.UserRole + 1) == msg_idx:
+                return r
+        return None
+
     def _on_message_selected(self):
         items = self.message_table.selectedItems()
+        pending = self._pending_signal_name
+        preserve = self._preserving_signal_filter
+        self._pending_signal_name = None
+        self._preserving_signal_filter = False
         if not items:
             self.current_signal_rows = []
             self._populate_signals([])
             self.bit_layout.set_message(0, [])
+            self.message_detail.setText("")
             return
         row_idx = items[0].data(Qt.UserRole + 1)
         msg_row = self.message_rows[row_idx]
         self.current_signal_rows = signal_rows(msg_row.message)
-        self.signal_search.clear()
+        if not preserve:
+            self.signal_search.blockSignals(True)
+            self.signal_search.clear()
+            self.signal_search.blockSignals(False)
+            self.signal_hits.hide()
+            self.signal_hits.clear()
         self._populate_signals(self.current_signal_rows)
+        self._set_message_detail(msg_row)
         self.bit_layout.set_message(msg_row.dlc, self.current_signal_rows)
         overlap = self.bit_layout.overlap_count()
         suffix = f"  ⚠ {overlap} overlapping bit(s)" if overlap else ""
         self.bitlayout_label.setText(f"Bit layout ({msg_row.dlc} bytes){suffix}:")
+        if preserve and self.signal_search.text():
+            self._filter_signals(self.signal_search.text())
+            self._refresh_signal_hits(self.signal_search.text())
+        if pending:
+            self._select_signal_by_name(pending)
+
+    def _set_message_detail(self, msg_row):
+        cycle = f"{msg_row.cycle_time} ms" if msg_row.cycle_time else "—"
+        lines = [f"Cycle: {cycle}    Receivers: {msg_row.receivers}"]
+        if msg_row.comment:
+            lines.append(msg_row.comment)
+        self.message_detail.setText("\n".join(lines))
 
     # ------------------------------------------------------------- signals
 
@@ -228,21 +309,96 @@ class BrowserTab(QWidget):
                 self.signal_table.setItem(row_idx, col, item)
         self.values_table.setRowCount(0)
         self.values_label.setText("Value table: (select a signal)")
+        self.signal_meta.setText("")
+
+    def _on_signal_query_changed(self, text: str):
+        self._filter_signals(text)
+        self._refresh_signal_hits(text)
 
     def _filter_signals(self, text: str):
         text = text.strip().lower()
         for r in range(self.signal_table.rowCount()):
-            name = self.signal_table.item(r, 0).text().lower()
-            self.signal_table.setRowHidden(r, text not in name)
+            item = self.signal_table.item(r, 0)
+            if item is None:
+                continue
+            self.signal_table.setRowHidden(r, text not in item.text().lower())
+
+    def _refresh_signal_hits(self, text: str):
+        self.signal_hits.clear()
+        query = text.strip().lower()
+        if not query:
+            self.signal_hits.hide()
+            return
+        shown = 0
+        truncated = False
+        for msg_idx, msg_row in enumerate(self.message_rows):
+            for signal in msg_row.message.signals:
+                if query not in signal.name.lower() and query not in msg_row.name.lower():
+                    continue
+                item = QListWidgetItem(f"{msg_row.name}  —  {signal.name}")
+                item.setData(Qt.UserRole, (msg_idx, signal.name))
+                self.signal_hits.addItem(item)
+                shown += 1
+                if shown >= 40:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if truncated:
+            more = QListWidgetItem("Keep typing to narrow the matches…")
+            more.setFlags(Qt.NoItemFlags)
+            self.signal_hits.addItem(more)
+        self.signal_hits.setVisible(shown > 0)
+
+    def _activate_signal_query(self):
+        visible = [
+            r
+            for r in range(self.signal_table.rowCount())
+            if not self.signal_table.isRowHidden(r)
+        ]
+        if len(visible) == 1:
+            self.signal_table.selectRow(visible[0])
+            return
+        for i in range(self.signal_hits.count()):
+            item = self.signal_hits.item(i)
+            if item is not None and item.flags() & Qt.ItemIsEnabled:
+                self._jump_to_signal_hit(item)
+                return
+
+    def _jump_to_signal_hit(self, item):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        msg_idx, sig_name = data
+        if not (0 <= msg_idx < len(self.message_rows)):
+            return
+        name = self.message_rows[msg_idx].name
+        # Defer so this click handler is not still using the hits list when
+        # the jump rebuilds it.
+        QTimer.singleShot(0, lambda: self.show_message(name, sig_name, keep_query=True))
+
+    def _select_signal_by_name(self, name: str):
+        for r in range(self.signal_table.rowCount()):
+            item = self.signal_table.item(r, 0)
+            if item is not None and item.text() == name:
+                self.signal_table.setRowHidden(r, False)
+                self.signal_table.selectRow(r)
+                self.signal_table.scrollToItem(item)
+                return
 
     def _on_signal_selected(self):
         items = self.signal_table.selectedItems()
         if not items:
             self.bit_layout.set_selected_signal(None)
+            self.signal_meta.setText("")
             return
         row_idx = items[0].data(Qt.UserRole + 1)
         sig_row = self.current_signal_rows[row_idx]
         self.bit_layout.set_selected_signal(sig_row.name)
+        meta = [f"Receivers: {sig_row.receivers}"]
+        if sig_row.comment:
+            meta.append(sig_row.comment)
+        self.signal_meta.setText("\n".join(meta))
 
         if sig_row.choices:
             self.values_label.setText(f"Value table for '{sig_row.name}':")

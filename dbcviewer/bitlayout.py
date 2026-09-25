@@ -4,7 +4,7 @@ each signal occupies, so overlaps and gaps are visible at a glance.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
@@ -61,6 +61,8 @@ def _is_safe_multiplex_group(signals) -> bool:
 
 class BitLayoutWidget(QWidget):
     """Renders the bit grid for the currently selected message."""
+
+    signal_clicked = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,6 +188,22 @@ class BitLayoutWidget(QWidget):
             return None
         weight = 7 - col
         return (byte_idx, weight)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        cell = self._cell_at(event.position().toPoint())
+        if cell is None:
+            return
+        names = self._cell_signals.get(cell, [])
+        if not names:
+            return
+        if self._selected_signal in names and len(names) > 1:
+            idx = names.index(self._selected_signal)
+            chosen = names[(idx + 1) % len(names)]
+        else:
+            chosen = names[0]
+        self.signal_clicked.emit(chosen)
 
     def mouseMoveEvent(self, event):
         cell = self._cell_at(event.position().toPoint())

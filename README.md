@@ -6,25 +6,36 @@ structure, compare two `.dbc` files, replay a logged CAN capture against a
 
 ## Features
 
-- **DBC Viewer tab** — open a `.dbc` file via a file picker or drag-and-drop:
-  - **Message list** — name, CAN ID (hex/dec), DLC, transmitting node(s)
+- **DBC Viewer tab** — open a `.dbc` file via a file picker, File → Open
+  Recent, or drag-and-drop:
+  - **Message list** — name, CAN ID (hex/dec), DLC, transmitting node(s),
+    plus cycle time, receivers, and the message comment
   - **Signal list** — start bit, length, byte order, sign, factor, offset,
-    min/max, unit
+    min/max, unit, receivers, and comment
   - **Value tables** — enum labels (e.g. `0 = Off`, `1 = On`) for signals that
     define them
   - **Bit-layout diagram** — a per-message grid showing which bits each
-    signal occupies, so gaps and overlaps are visible at a glance
-  - **Search/filter** — filter the message list by name or ID, and the
-    signal list by name
-- **DBC Compare tab** — load a second `.dbc` and see a side-by-side diff:
-  messages/signals added, removed, or changed (ID, DLC, node, bit layout,
-  scaling, value tables, etc.)
+    signal occupies, so gaps and overlaps are visible at a glance. Click a
+    cell to select that signal
+  - **Search** — filter messages by name or ID, and find a signal anywhere
+    in the file (the hit list jumps to its message)
+- **DBC Compare tab** — File A starts as the DBC Viewer file. Load a second
+  `.dbc` (or drop it on this tab) and see a side-by-side diff: messages and
+  signals added, removed, or changed (ID, DLC, node, bit layout, scaling,
+  value tables, etc.). Groups stay collapsed, a filter narrows the tree, and
+  double-clicking a message or signal opens it in the viewer
 - **Log Replay tab** — decode a CAN log file (any format `python-can`
   supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) against a
-  `.dbc` and plot selected signals, with pan/zoom/reset on the plot
+  `.dbc` and plot selected signals. Plots are lines, with point markers only
+  when zoomed in; From/To sets the time window and the label shows min/max
+  in that window. Re-decode reruns the log after a DBC change. Drop a log
+  file on the window to open it here
 - **Live Signal Viewer tab** — connect to a PEAK PCAN-USB (FD) adapter over
   USB, decode live classic-CAN or CAN-FD traffic against a `.dbc`, and plot
-  selected signals in real time over a scrolling time window
+  selected signals in real time over a scrolling time window. Every DBC
+  signal is listed before traffic arrives. Pause freezes the window. The
+  status line counts frames, error frames, and unmapped IDs. CAN-FD bitrate
+  settings sit on their own row
 
 The DBC Compare, Log Replay, and Live Signal Viewer tabs all default to
 sharing whatever `.dbc` is currently loaded in the DBC Viewer tab, but can

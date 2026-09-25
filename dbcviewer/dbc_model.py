@@ -46,6 +46,18 @@ def format_senders(senders) -> str:
     return ", ".join(senders) if senders else "—"
 
 
+def message_receivers(message) -> str:
+    """Unique receiver nodes across every signal on `message`, in first-seen order."""
+    names = []
+    seen = set()
+    for signal in message.signals:
+        for name in signal.receivers or []:
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return format_senders(names)
+
+
 def signal_bit_cells(signal) -> list[tuple[int, int]]:
     """Return the list of (byte_index, bit_weight) cells a signal occupies.
 
@@ -112,6 +124,8 @@ class SignalRow:
     maximum: float | None
     unit: str
     mux: str
+    receivers: str
+    comment: str
     choices: list[tuple[int, str]] = field(default_factory=list)
     signal: object = None  # original cantools Signal, for the bit-layout widget
 
@@ -129,6 +143,8 @@ class SignalRow:
             maximum=signal.maximum,
             unit=signal.unit or "",
             mux=mux_label(signal),
+            receivers=format_senders(signal.receivers),
+            comment=signal.comment or "",
             choices=choices_list(signal),
             signal=signal,
         )
@@ -143,16 +159,23 @@ class MessageRow:
     is_extended: bool
     dlc: int
     senders: str
+    receivers: str
+    cycle_time: int | None
+    comment: str
     message: object = None  # original cantools Message
 
     @classmethod
     def from_message(cls, message) -> "MessageRow":
+        cycle = message.cycle_time or None
         return cls(
             name=message.name,
             frame_id=message.frame_id,
             is_extended=bool(message.is_extended_frame),
             dlc=message.length,
             senders=format_senders(message.senders),
+            receivers=message_receivers(message),
+            cycle_time=int(cycle) if cycle else None,
+            comment=message.comment or "",
             message=message,
         )
 

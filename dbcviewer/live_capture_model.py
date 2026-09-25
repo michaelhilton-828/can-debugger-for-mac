@@ -78,6 +78,23 @@ class DecodedSample:
         return (self.message_name, self.signal_name)
 
 
+def classify_frame(msg, database) -> str:
+    """Bucket one received frame for the live status counters.
+
+    Returns "error", "remote", "unmapped", or "data". Decode failures of a
+    mapped ID still count as "data" — they are not an unknown arbitration ID.
+    """
+    if msg.is_error_frame:
+        return "error"
+    if msg.is_remote_frame:
+        return "remote"
+    try:
+        database.get_message_by_frame_id(msg.arbitration_id)
+    except KeyError:
+        return "unmapped"
+    return "data"
+
+
 def decode_frame(msg, database) -> list[DecodedSample]:
     """Decode one received can.Message against `database`.
 

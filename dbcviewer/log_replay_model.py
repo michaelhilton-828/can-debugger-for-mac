@@ -116,6 +116,36 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
     return signals, unmapped_ids
 
 
+# Draw point markers only while this many samples (or fewer) are in view.
+# A full log is a line; zooming in far enough brings the markers back.
+MARKER_VISIBLE_LIMIT = 400
+
+
+def marker_for_count(visible_count: int) -> str:
+    """Matplotlib marker for a line with `visible_count` points in the x window.
+
+    ``"None"`` is the marker style that draws the line with no point markers.
+    A bare ``None`` is rejected by matplotlib's MarkerStyle.
+    """
+    if visible_count <= 0 or visible_count > MARKER_VISIBLE_LIMIT:
+        return "None"
+    return "."
+
+
+def numeric_minmax(times, values, t_min: float, t_max: float):
+    """Min/max of numeric samples whose time falls in [t_min, t_max], or None."""
+    lo = min(t_min, t_max)
+    hi = max(t_min, t_max)
+    nums = [
+        v
+        for t, v in zip(times, values)
+        if lo <= t <= hi and isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    if not nums:
+        return None
+    return min(nums), max(nums)
+
+
 def enum_ticks(choices: dict) -> tuple[list, list[str]]:
     """Sorted (positions, labels) for relabeling a Y-axis from a signal's
     value table, or ([], []) if `choices` is empty/falsy."""

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -29,12 +30,21 @@ from PySide6.QtWidgets import (
 )
 
 from .dbc_model import DbcLoadError, format_id_hex, load_database
-from .log_replay_model import LogLoadError, enum_ticks, load_log, supported_log_extensions
+from .log_replay_model import (
+    LogLoadError,
+    enum_ticks,
+    load_log,
+    marker_for_count,
+    numeric_minmax,
+    supported_log_extensions,
+)
 
 SIGNAL_HEADERS = ["Message", "Signal", "Unit", "ID (hex)", "Samples"]
 
 
 class LogReplayTab(QWidget):
+    log_loaded = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.database = None
@@ -45,6 +55,11 @@ class LogReplayTab(QWidget):
 
         self._signals = {}
         self._row_keys = []
+        self._log_path = ""
+        self._t0 = 0.0
+        self._plotted = []
+        self._updating_range = False
+        self._in_redraw = False
 
         self._build_ui()
         self._update_dbc_label()
@@ -70,9 +85,13 @@ class LogReplayTab(QWidget):
         log_row = QHBoxLayout()
         self.log_open_button = QPushButton("Open log…")
         self.log_open_button.clicked.connect(self._open_log_dialog)
+        self.redecode_button = QPushButton("Re-decode")
+        self.redecode_button.setEnabled(False)
+        self.redecode_button.clicked.connect(self._redecode)
         self.log_path_label = QLabel("No log loaded")
         self.log_path_label.setStyleSheet("color: #555;")
         log_row.addWidget(self.log_open_button)
+        log_row.addWidget(self.redecode_button)
         log_row.addWidget(self.log_path_label, 1)
         root.addLayout(log_row)
 
@@ -107,10 +126,26 @@ class LogReplayTab(QWidget):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        options = QHBoxLayout()
         self.overlay_checkbox = QCheckBox("Overlay on one plot")
         self.overlay_checkbox.setChecked(True)
         self.overlay_checkbox.stateChanged.connect(self._redraw)
-        right_layout.addWidget(self.overlay_checkbox)
+        options.addWidget(self.overlay_checkbox)
+        options.addWidget(QLabel("From"))
+        self.range_from = self._make_time_spin()
+        self.range_to = self._make_time_spin()
+        self.range_from.valueChanged.connect(self._on_range_edited)
+        self.range_to.valueChanged.connect(self._on_range_edited)
+        options.addWidget(self.range_from)
+        options.addWidget(QLabel("to"))
+        options.addWidget(self.range_to)
+        options.addWidget(QLabel("s"))
+        options.addStretch(1)
+        right_layout.addLayout(options)
+        self.stats_label = QLabel("")
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet("color: #333;")
+        right_layout.addWidget(self.stats_label)
 
         self.figure = Figure()
         self.canvas = FigureCanvasQTAgg(self.figure)
@@ -121,6 +156,15 @@ class LogReplayTab(QWidget):
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
+
+    @staticmethod
+    def _make_time_spin() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0, 1_000_000)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.1)
+        spin.setMaximumWidth(110)
+        return spin
 
     # -------------------------------------------------------------- DBC sync
 
@@ -136,10 +180,8 @@ class LogReplayTab(QWidget):
         self.dbc_use_browser_button.setEnabled(self._using_independent_dbc)
         if not self._using_independent_dbc:
             self.database = database
-            if self._signals:
-                self.status_label.setText(
-                    self.status_label.text() + "  (DBC changed - reopen the log to re-decode)"
-                )
+            self._mark_log_stale()
+        self._update_redecode_enabled()
         self._update_dbc_label()
 
     def _update_dbc_label(self):
@@ -164,13 +206,28 @@ class LogReplayTab(QWidget):
         self._using_independent_dbc = True
         self.database = database
         self.dbc_use_browser_button.setEnabled(True)
+        self._mark_log_stale()
+        self._update_redecode_enabled()
         self._update_dbc_label()
 
     def _use_browser_dbc(self):
         self._using_independent_dbc = False
         self.database = self._browser_database
         self.dbc_use_browser_button.setEnabled(False)
+        self._mark_log_stale()
+        self._update_redecode_enabled()
         self._update_dbc_label()
+
+    def _update_redecode_enabled(self):
+        self.redecode_button.setEnabled(bool(self._log_path) and self.database is not None)
+
+    def _mark_log_stale(self):
+        if not self._log_path or not self._signals:
+            return
+        suffix = "  DBC changed — click Re-decode."
+        text = self.status_label.text()
+        if not text.endswith(suffix):
+            self.status_label.setText(text + suffix)
 
     # -------------------------------------------------------------- log
 
@@ -180,31 +237,58 @@ class LogReplayTab(QWidget):
         filter_str = f"CAN log files ({pattern});;All files (*)"
         path, _ = QFileDialog.getOpenFileName(self, "Open log file", "", filter_str)
         if path:
-            self._load_log(path)
+            self.load_log_file(path)
 
-    def _load_log(self, path: str):
+    def load_log_file(self, path: str) -> bool:
+        """Decode `path` against the current DBC. Public for drops and Open Recent."""
         if self.database is None:
             QMessageBox.warning(self, "No DBC loaded", "Load a .dbc file before opening a log.")
-            return
+            return False
 
         try:
             signals, unmapped_ids = load_log(path, self.database)
         except LogLoadError as exc:
             QMessageBox.critical(self, "Failed to load log file", str(exc))
-            return
+            return False
 
+        self._log_path = path
         self.log_path_label.setText(path)
         self._signals = signals
+        stamped = [s.times[0] for s in signals.values() if s.times]
+        self._t0 = min(stamped) if stamped else 0.0
         self._row_keys = sorted(
             signals.keys(), key=lambda k: (signals[k].arbitration_id, k[0], k[1])
         )
         self._populate_signal_table()
+        self._set_full_range()
+        self._update_redecode_enabled()
 
         message_count = len({s.message_name for s in signals.values()})
         status = f"Decoded {len(signals)} signal(s) from {message_count} message(s)."
         if unmapped_ids:
             status += f" {len(unmapped_ids)} unmapped ID(s) shown as \"Unknown\"."
         self.status_label.setText(status)
+        self._redraw()
+        self.log_loaded.emit(path)
+        return True
+
+    def _redecode(self):
+        if self._log_path:
+            self.load_log_file(self._log_path)
+
+    def _set_full_range(self):
+        end = 0.0
+        for series in self._signals.values():
+            if series.times:
+                end = max(end, max(series.times) - self._t0)
+        self._updating_range = True
+        self.range_from.setValue(0)
+        self.range_to.setValue(end)
+        self._updating_range = False
+
+    def _on_range_edited(self):
+        if self._updating_range or self._in_redraw:
+            return
         self._redraw()
 
     # ------------------------------------------------------------- signals
@@ -252,39 +336,99 @@ class LogReplayTab(QWidget):
     # --------------------------------------------------------------- plot
 
     def _redraw(self):
+        if self._in_redraw:
+            return
+        self._in_redraw = True
+        try:
+            self._redraw_plot()
+        finally:
+            self._in_redraw = False
+
+    def _redraw_plot(self):
         self.figure.clear()
-        selected = self._selected_series()
+        self._plotted = []
+        selected = [s for s in self._selected_series() if s.times]
         if not selected:
+            self.stats_label.setText("")
             self.canvas.draw_idle()
             return
 
         overlay = self.overlay_checkbox.isChecked() or len(selected) == 1
-        t0 = min(min(s.times) for s in selected)
-
         if overlay:
-            ax = self.figure.add_subplot(111)
+            axes = [self.figure.add_subplot(111)]
             for s in selected:
-                t = [x - t0 for x in s.times]
-                ax.plot(t, s.values, marker=".", label=s.display_label)
-                positions, labels = enum_ticks(s.choices)
-                if positions:
-                    ax.set_yticks(positions)
-                    ax.set_yticklabels(labels)
-            ax.set_xlabel("Time (s)")
-            ax.legend()
-            ax.grid(True)
+                self._plot_series(axes[0], s, label=s.display_label)
+            axes[0].set_xlabel("Time (s)")
+            axes[0].legend()
+            axes[0].grid(True)
+            primary = axes[0]
         else:
             axes = self.figure.subplots(len(selected), 1, sharex=True)
+            if len(selected) == 1:
+                axes = [axes]
             for ax, s in zip(axes, selected):
-                t = [x - t0 for x in s.times]
-                ax.plot(t, s.values, marker=".")
+                self._plot_series(ax, s)
                 ax.set_ylabel(s.display_label)
-                positions, labels = enum_ticks(s.choices)
-                if positions:
-                    ax.set_yticks(positions)
-                    ax.set_yticklabels(labels)
                 ax.grid(True)
             axes[-1].set_xlabel("Time (s)")
+            primary = axes[-1]
 
+        t_min, t_max = self._range_limits()
+        self._updating_range = True
+        primary.set_xlim(t_min, t_max)
+        self._updating_range = False
+        self._style_markers(t_min, t_max)
+        self._update_stats(t_min, t_max)
         self.figure.tight_layout()
+        primary.callbacks.connect("xlim_changed", self._on_xlim_changed)
+        self.canvas.draw_idle()
+
+    def _plot_series(self, ax, series, label=None):
+        rel = [x - self._t0 for x in series.times]
+        kwargs = {}
+        if label:
+            kwargs["label"] = label
+        line, = ax.plot(rel, series.values, **kwargs)
+        self._plotted.append((line, rel, series.values, series.signal_name))
+        positions, labels = enum_ticks(series.choices)
+        if positions:
+            ax.set_yticks(positions)
+            ax.set_yticklabels(labels)
+
+    def _range_limits(self) -> tuple[float, float]:
+        start = self.range_from.value()
+        end = self.range_to.value()
+        if end < start:
+            return end, start
+        if end == start:
+            return start, start + 1e-3
+        return start, end
+
+    def _style_markers(self, t_min: float, t_max: float):
+        for line, times, _values, _name in self._plotted:
+            visible = sum(1 for t in times if t_min <= t <= t_max)
+            line.set_marker(marker_for_count(visible))
+
+    def _update_stats(self, t_min: float, t_max: float):
+        parts = []
+        for _line, times, values, name in self._plotted:
+            span = numeric_minmax(times, values, t_min, t_max)
+            if span is None:
+                continue
+            lo, hi = span
+            parts.append(f"{name} min {lo:g} max {hi:g}")
+        self.stats_label.setText(
+            "   ".join(parts) if parts else "No numeric samples in this time range"
+        )
+
+    def _on_xlim_changed(self, ax):
+        if self._updating_range:
+            return
+        xmin, xmax = ax.get_xlim()
+        self._updating_range = True
+        self.range_from.setValue(max(0.0, xmin))
+        self.range_to.setValue(max(0.0, xmax))
+        self._updating_range = False
+        self._style_markers(xmin, xmax)
+        self._update_stats(xmin, xmax)
         self.canvas.draw_idle()
