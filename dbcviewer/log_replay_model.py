@@ -7,6 +7,7 @@ trivially testable without a display or a Qt/matplotlib backend.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 import can
@@ -130,6 +131,53 @@ def marker_for_count(visible_count: int) -> str:
     if visible_count <= 0 or visible_count > MARKER_VISIBLE_LIMIT:
         return "None"
     return "."
+
+
+def padded_range(lo: float, hi: float, fraction: float = 0.05) -> tuple[float, float]:
+    """Expand [lo, hi] by `fraction` of its span so points are not clipped by the spine."""
+    if lo > hi:
+        lo, hi = hi, lo
+    if lo == hi:
+        pad = 1.0 if lo == 0 else abs(lo) * fraction
+    else:
+        pad = (hi - lo) * fraction
+    return lo - pad, hi + pad
+
+
+def zoom_about(lo: float, hi: float, center: float, scale: float) -> tuple[float, float]:
+    """Scale the distance from `center` to each end. scale < 1 zooms in."""
+    return center + (lo - center) * scale, center + (hi - center) * scale
+
+
+def nearest_index(times, t: float):
+    """Index of the sample closest to `t`, or None if `times` is empty.
+
+    `times` must be sorted ascending.
+    """
+    if not times:
+        return None
+    i = bisect.bisect_left(times, t)
+    if i >= len(times):
+        return len(times) - 1
+    if i == 0:
+        return 0
+    if abs(times[i] - t) < abs(times[i - 1] - t):
+        return i
+    return i - 1
+
+
+def format_signal_value(value, choices) -> str:
+    """Physical value, or the value-table label when one matches exactly."""
+    if choices:
+        if value in choices:
+            return str(choices[value])
+        if isinstance(value, float) and value.is_integer():
+            iv = int(value)
+            if iv in choices:
+                return str(choices[iv])
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
 
 
 def numeric_minmax(times, values, t_min: float, t_max: float):

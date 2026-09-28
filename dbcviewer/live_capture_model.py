@@ -62,6 +62,19 @@ def build_bus_kwargs(config: BusConfig) -> dict:
 
 
 @dataclass
+class DecodeDatabase:
+    """One loaded DBC used while decoding live frames.
+
+    `source_id` distinguishes files that happen to reuse message or signal
+    names. `label` is the short name shown in the signal table.
+    """
+
+    source_id: str
+    label: str
+    database: object
+
+
+@dataclass
 class DecodedSample:
     """One decoded signal value from one received CAN frame."""
 
@@ -72,44 +85,74 @@ class DecodedSample:
     choices: dict
     time: float
     value: object
+    source_id: str = ""
+    dbc_label: str = ""
 
     @property
-    def key(self) -> tuple[str, str]:
-        return (self.message_name, self.signal_name)
+    def key(self) -> tuple[str, str, str]:
+        return (self.source_id, self.message_name, self.signal_name)
 
 
-def classify_frame(msg, database) -> str:
+def _decode_entries(databases) -> list[DecodeDatabase]:
+    """Normalize a database, a DecodeDatabase, or a sequence of either."""
+    if databases is None:
+        return []
+    if isinstance(databases, DecodeDatabase):
+        return [databases]
+    if isinstance(databases, (list, tuple)):
+        entries = []
+        for item in databases:
+            if isinstance(item, DecodeDatabase):
+                entries.append(item)
+            elif item is not None:
+                entries.append(DecodeDatabase("", "", item))
+        return entries
+    return [DecodeDatabase("", "", databases)]
+
+
+def _matching_entry(msg, databases):
+    """First DBC that defines `msg.arbitration_id`, or None.
+
+    Earlier entries win when several files use the same CAN ID.
+    """
+    for entry in _decode_entries(databases):
+        try:
+            message = entry.database.get_message_by_frame_id(msg.arbitration_id)
+        except KeyError:
+            continue
+        return entry, message
+    return None
+
+
+def classify_frame(msg, databases) -> str:
     """Bucket one received frame for the live status counters.
 
-    Returns "error", "remote", "unmapped", or "data". Decode failures of a
-    mapped ID still count as "data" — they are not an unknown arbitration ID.
+    `databases` is one cantools database or a sequence of them (or
+    DecodeDatabase wrappers). Returns "error", "remote", "unmapped", or
+    "data". Decode failures of a mapped ID still count as "data".
     """
     if msg.is_error_frame:
         return "error"
     if msg.is_remote_frame:
         return "remote"
-    try:
-        database.get_message_by_frame_id(msg.arbitration_id)
-    except KeyError:
+    if _matching_entry(msg, databases) is None:
         return "unmapped"
     return "data"
 
 
-def decode_frame(msg, database) -> list[DecodedSample]:
-    """Decode one received can.Message against `database`.
+def decode_frame(msg, databases) -> list[DecodedSample]:
+    """Decode one received can.Message against one or more databases.
 
-    Same tolerant, best-effort philosophy as log_replay_model.load_log()'s
-    inner loop: error/remote frames are skipped, an unmapped arbitration_id
-    or any decode failure yields [] rather than raising - only setup-level
-    problems (bad bus config, missing driver) are ever exceptional for live
-    capture, not individual malformed/partial frames.
+    Error and remote frames are skipped. An arbitration ID that none of the
+    databases define, or any decode failure, yields [] rather than raising.
+    When more than one database defines the ID, the earliest one is used.
     """
     if msg.is_error_frame or msg.is_remote_frame:
         return []
-    try:
-        dbc_msg = database.get_message_by_frame_id(msg.arbitration_id)
-    except KeyError:
+    matched = _matching_entry(msg, databases)
+    if matched is None:
         return []
+    entry, dbc_msg = matched
     try:
         decoded = dbc_msg.decode(msg.data, decode_choices=True, allow_truncated=True)
     except Exception:
@@ -128,6 +171,8 @@ def decode_frame(msg, database) -> list[DecodedSample]:
                 choices=sig_def.choices or {},
                 time=msg.timestamp,
                 value=numeric_value,
+                source_id=entry.source_id,
+                dbc_label=entry.label,
             )
         )
     return samples
@@ -141,17 +186,22 @@ class LiveSignalBuffer:
     signal_name: str
     arbitration_id: int
     unit: str
+    source_id: str = ""
+    dbc_label: str = ""
     choices: dict = field(default_factory=dict)
     times: deque = field(default_factory=deque)
     values: deque = field(default_factory=deque)
 
     @property
-    def key(self) -> tuple[str, str]:
-        return (self.message_name, self.signal_name)
+    def key(self) -> tuple[str, str, str]:
+        return (self.source_id, self.message_name, self.signal_name)
 
     @property
     def display_label(self) -> str:
-        return f"{self.signal_name} [{self.unit}]" if self.unit else self.signal_name
+        base = f"{self.signal_name} [{self.unit}]" if self.unit else self.signal_name
+        if self.dbc_label:
+            return f"{self.dbc_label}: {base}"
+        return base
 
     def append(self, t: float, value) -> None:
         self.times.append(t)

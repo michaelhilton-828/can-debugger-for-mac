@@ -33,10 +33,10 @@ class LiveCaptureWorker(QThread):
     error = Signal(str)
     finished_clean = Signal()
 
-    def __init__(self, bus_kwargs: dict, database, parent=None):
+    def __init__(self, bus_kwargs: dict, databases, parent=None):
         super().__init__(parent)
         self._bus_kwargs = bus_kwargs  # interface="pcan" already included by caller
-        self._database = database
+        self._databases = databases
 
     def run(self) -> None:
         try:
@@ -67,13 +67,13 @@ class LiveCaptureWorker(QThread):
                     return
                 if msg is not None:
                     frames += 1
-                    kind = classify_frame(msg, self._database)
+                    kind = classify_frame(msg, self._databases)
                     if kind == "error":
                         errors += 1
                     elif kind == "unmapped":
                         unmapped += 1
                     elif kind == "data":
-                        for sample in decode_frame(msg, self._database):
+                        for sample in decode_frame(msg, self._databases):
                             sample.time = time.monotonic() - t0
                             batch.append(sample)
                 now = time.monotonic()

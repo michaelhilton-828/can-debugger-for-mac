@@ -8,15 +8,11 @@ embedded directly in the tab via matplotlib's Qt canvas.
 
 from __future__ import annotations
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
-    QDoubleSpinBox,
     QFileDialog,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -30,16 +26,25 @@ from PySide6.QtWidgets import (
 )
 
 from .dbc_model import DbcLoadError, format_id_hex, load_database
+from .log_plot import ElidingLabel, FlowHost, SignalPlot
 from .log_replay_model import (
     LogLoadError,
-    enum_ticks,
+    format_signal_value,
     load_log,
-    marker_for_count,
+    nearest_index,
     numeric_minmax,
     supported_log_extensions,
 )
 
-SIGNAL_HEADERS = ["Message", "Signal", "Unit", "ID (hex)", "Samples"]
+SIGNAL_HEADERS = ["", "Message", "Signal", "Unit", "ID (hex)", "Samples", "Value", "Δ", "Min", "Max"]
+COL_COLOR = 0
+COL_MESSAGE = 1
+COL_SIGNAL = 2
+COL_SAMPLES = 5
+COL_VALUE = 6
+COL_DELTA = 7
+COL_MIN = 8
+COL_MAX = 9
 
 
 class LogReplayTab(QWidget):
@@ -57,9 +62,8 @@ class LogReplayTab(QWidget):
         self._row_keys = []
         self._log_path = ""
         self._t0 = 0.0
-        self._plotted = []
-        self._updating_range = False
-        self._in_redraw = False
+        self._log_end = 0.0
+        self._fit_on_next = False
 
         self._build_ui()
         self._update_dbc_label()
@@ -68,34 +72,36 @@ class LogReplayTab(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setSpacing(6)
 
-        dbc_row = QHBoxLayout()
-        self.dbc_label = QLabel("No DBC loaded")
-        self.dbc_label.setStyleSheet("color: #555;")
+        self._dbc_row = FlowHost()
         self.dbc_open_button = QPushButton("Open .dbc…")
         self.dbc_open_button.clicked.connect(self._open_dbc_dialog)
         self.dbc_use_browser_button = QPushButton("Use DBC Viewer tab's DBC")
         self.dbc_use_browser_button.clicked.connect(self._use_browser_dbc)
         self.dbc_use_browser_button.setEnabled(False)
-        dbc_row.addWidget(self.dbc_label, 1)
-        dbc_row.addWidget(self.dbc_open_button)
-        dbc_row.addWidget(self.dbc_use_browser_button)
-        root.addLayout(dbc_row)
+        self.dbc_label = ElidingLabel("No DBC loaded")
+        self.dbc_label.setStyleSheet("color: #555;")
+        self._dbc_row.flow.addWidget(self.dbc_open_button)
+        self._dbc_row.flow.addWidget(self.dbc_use_browser_button)
+        self._dbc_row.flow.addWidget(self.dbc_label)
+        root.addWidget(self._dbc_row)
 
-        log_row = QHBoxLayout()
+        self._log_row = FlowHost()
         self.log_open_button = QPushButton("Open log…")
         self.log_open_button.clicked.connect(self._open_log_dialog)
         self.redecode_button = QPushButton("Re-decode")
         self.redecode_button.setEnabled(False)
         self.redecode_button.clicked.connect(self._redecode)
-        self.log_path_label = QLabel("No log loaded")
+        self.log_path_label = ElidingLabel("No log loaded")
         self.log_path_label.setStyleSheet("color: #555;")
-        log_row.addWidget(self.log_open_button)
-        log_row.addWidget(self.redecode_button)
-        log_row.addWidget(self.log_path_label, 1)
-        root.addLayout(log_row)
+        self._log_row.flow.addWidget(self.log_open_button)
+        self._log_row.flow.addWidget(self.redecode_button)
+        self._log_row.flow.addWidget(self.log_path_label)
+        root.addWidget(self._log_row)
 
         self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -115,56 +121,40 @@ class LogReplayTab(QWidget):
         self.signal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.signal_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.signal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.signal_table.horizontalHeader().setStretchLastSection(True)
+        header = self.signal_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(COL_SIGNAL, QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_COLOR, QHeaderView.Fixed)
+        self.signal_table.setColumnWidth(COL_COLOR, 28)
+        self.signal_table.setColumnWidth(COL_MESSAGE, 120)
+        self.signal_table.setColumnWidth(COL_SAMPLES, 72)
+        self.signal_table.setColumnWidth(COL_VALUE, 88)
+        self.signal_table.setColumnWidth(COL_DELTA, 72)
+        self.signal_table.setColumnWidth(COL_MIN, 72)
+        self.signal_table.setColumnWidth(COL_MAX, 72)
         self.signal_table.setSortingEnabled(True)
         self.signal_table.itemSelectionChanged.connect(self._on_selection_changed)
         left_layout.addWidget(self.signal_table, 1)
+        left.setMinimumWidth(180)
         splitter.addWidget(left)
 
-        # --- right: plot options + embedded canvas -------------------------
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        options = QHBoxLayout()
-        self.overlay_checkbox = QCheckBox("Overlay on one plot")
-        self.overlay_checkbox.setChecked(True)
-        self.overlay_checkbox.stateChanged.connect(self._redraw)
-        options.addWidget(self.overlay_checkbox)
-        options.addWidget(QLabel("From"))
-        self.range_from = self._make_time_spin()
-        self.range_to = self._make_time_spin()
-        self.range_from.valueChanged.connect(self._on_range_edited)
-        self.range_to.valueChanged.connect(self._on_range_edited)
-        options.addWidget(self.range_from)
-        options.addWidget(QLabel("to"))
-        options.addWidget(self.range_to)
-        options.addWidget(QLabel("s"))
-        options.addStretch(1)
-        right_layout.addLayout(options)
-        self.stats_label = QLabel("")
-        self.stats_label.setWordWrap(True)
-        self.stats_label.setStyleSheet("color: #333;")
-        right_layout.addWidget(self.stats_label)
+        self.plot = SignalPlot()
+        self.plot.setMinimumWidth(260)
+        self.plot.view_changed.connect(lambda _lo, _hi: self._refresh_measurement_columns())
+        self.plot.cursors_changed.connect(lambda _a, _b: self._refresh_measurement_columns())
+        splitter.addWidget(self.plot)
 
-        self.figure = Figure()
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        right_layout.addWidget(self.toolbar)
-        right_layout.addWidget(self.canvas, 1)
-        splitter.addWidget(right)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        self._flow_rows = (self._dbc_row, self._log_row)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-
-    @staticmethod
-    def _make_time_spin() -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
-        spin.setRange(0, 1_000_000)
-        spin.setDecimals(3)
-        spin.setSingleStep(0.1)
-        spin.setMaximumWidth(110)
-        return spin
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for row in self._flow_rows:
+            height = row.heightForWidth(max(1, row.width()))
+            if height > 0 and row.height() != height:
+                row.setFixedHeight(height)
 
     # -------------------------------------------------------------- DBC sync
 
@@ -186,11 +176,11 @@ class LogReplayTab(QWidget):
 
     def _update_dbc_label(self):
         if self.database is None:
-            self.dbc_label.setText("No DBC loaded")
+            self.dbc_label.set_full_text("No DBC loaded")
         elif self._using_independent_dbc:
-            self.dbc_label.setText(f"{self._independent_dbc_path} (independent)")
+            self.dbc_label.set_full_text(f"{self._independent_dbc_path} (independent)")
         else:
-            self.dbc_label.setText(f"{self._browser_database_path} (from DBC Viewer tab)")
+            self.dbc_label.set_full_text(f"{self._browser_database_path} (from DBC Viewer tab)")
 
     def _open_dbc_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
@@ -252,15 +242,19 @@ class LogReplayTab(QWidget):
             return False
 
         self._log_path = path
-        self.log_path_label.setText(path)
+        self.log_path_label.set_full_text(path)
         self._signals = signals
         stamped = [s.times[0] for s in signals.values() if s.times]
         self._t0 = min(stamped) if stamped else 0.0
+        self._log_end = 0.0
+        for series in signals.values():
+            if series.times:
+                self._log_end = max(self._log_end, max(series.times) - self._t0)
         self._row_keys = sorted(
             signals.keys(), key=lambda k: (signals[k].arbitration_id, k[0], k[1])
         )
         self._populate_signal_table()
-        self._set_full_range()
+        self._fit_on_next = True
         self._update_redecode_enabled()
 
         message_count = len({s.message_name for s in signals.values()})
@@ -268,28 +262,13 @@ class LogReplayTab(QWidget):
         if unmapped_ids:
             status += f" {len(unmapped_ids)} unmapped ID(s) shown as \"Unknown\"."
         self.status_label.setText(status)
-        self._redraw()
+        self._sync_plot()
         self.log_loaded.emit(path)
         return True
 
     def _redecode(self):
         if self._log_path:
             self.load_log_file(self._log_path)
-
-    def _set_full_range(self):
-        end = 0.0
-        for series in self._signals.values():
-            if series.times:
-                end = max(end, max(series.times) - self._t0)
-        self._updating_range = True
-        self.range_from.setValue(0)
-        self.range_to.setValue(end)
-        self._updating_range = False
-
-    def _on_range_edited(self):
-        if self._updating_range or self._in_redraw:
-            return
-        self._redraw()
 
     # ------------------------------------------------------------- signals
 
@@ -299,11 +278,16 @@ class LogReplayTab(QWidget):
         for row_idx, key in enumerate(self._row_keys):
             series = self._signals[key]
             values = [
+                "",
                 series.message_name,
                 series.signal_name,
                 series.unit,
                 format_id_hex(series.arbitration_id, series.arbitration_id > 0x7FF),
                 str(len(series.times)),
+                "",
+                "",
+                "",
+                "",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -314,7 +298,7 @@ class LogReplayTab(QWidget):
     def _filter_signals(self, text: str):
         text = text.strip().lower()
         for r in range(self.signal_table.rowCount()):
-            row_idx = self.signal_table.item(r, 0).data(Qt.UserRole + 1)
+            row_idx = self.signal_table.item(r, COL_MESSAGE).data(Qt.UserRole + 1)
             key = self._row_keys[row_idx]
             haystack = f"{key[0]} {key[1]}".lower()
             self.signal_table.setRowHidden(r, text not in haystack)
@@ -331,104 +315,105 @@ class LogReplayTab(QWidget):
         return selected
 
     def _on_selection_changed(self):
-        self._redraw()
+        self._sync_plot()
 
-    # --------------------------------------------------------------- plot
+    def _current_series(self):
+        row = self.signal_table.currentRow()
+        if row < 0:
+            return None
+        item = self.signal_table.item(row, COL_MESSAGE)
+        if item is None:
+            return None
+        row_idx = item.data(Qt.UserRole + 1)
+        series = self._signals[self._row_keys[row_idx]]
+        if series not in self._selected_series():
+            return None
+        return series
 
-    def _redraw(self):
-        if self._in_redraw:
-            return
-        self._in_redraw = True
-        try:
-            self._redraw_plot()
-        finally:
-            self._in_redraw = False
-
-    def _redraw_plot(self):
-        self.figure.clear()
-        self._plotted = []
-        selected = [s for s in self._selected_series() if s.times]
-        if not selected:
-            self.stats_label.setText("")
-            self.canvas.draw_idle()
-            return
-
-        overlay = self.overlay_checkbox.isChecked() or len(selected) == 1
-        if overlay:
-            axes = [self.figure.add_subplot(111)]
-            for s in selected:
-                self._plot_series(axes[0], s, label=s.display_label)
-            axes[0].set_xlabel("Time (s)")
-            axes[0].legend()
-            axes[0].grid(True)
-            primary = axes[0]
-        else:
-            axes = self.figure.subplots(len(selected), 1, sharex=True)
-            if len(selected) == 1:
-                axes = [axes]
-            for ax, s in zip(axes, selected):
-                self._plot_series(ax, s)
-                ax.set_ylabel(s.display_label)
-                ax.grid(True)
-            axes[-1].set_xlabel("Time (s)")
-            primary = axes[-1]
-
-        t_min, t_max = self._range_limits()
-        self._updating_range = True
-        primary.set_xlim(t_min, t_max)
-        self._updating_range = False
-        self._style_markers(t_min, t_max)
-        self._update_stats(t_min, t_max)
-        self.figure.tight_layout()
-        primary.callbacks.connect("xlim_changed", self._on_xlim_changed)
-        self.canvas.draw_idle()
-
-    def _plot_series(self, ax, series, label=None):
-        rel = [x - self._t0 for x in series.times]
-        kwargs = {}
-        if label:
-            kwargs["label"] = label
-        line, = ax.plot(rel, series.values, **kwargs)
-        self._plotted.append((line, rel, series.values, series.signal_name))
-        positions, labels = enum_ticks(series.choices)
-        if positions:
-            ax.set_yticks(positions)
-            ax.set_yticklabels(labels)
-
-    def _range_limits(self) -> tuple[float, float]:
-        start = self.range_from.value()
-        end = self.range_to.value()
-        if end < start:
-            return end, start
-        if end == start:
-            return start, start + 1e-3
-        return start, end
-
-    def _style_markers(self, t_min: float, t_max: float):
-        for line, times, _values, _name in self._plotted:
-            visible = sum(1 for t in times if t_min <= t <= t_max)
-            line.set_marker(marker_for_count(visible))
-
-    def _update_stats(self, t_min: float, t_max: float):
-        parts = []
-        for _line, times, values, name in self._plotted:
-            span = numeric_minmax(times, values, t_min, t_max)
-            if span is None:
-                continue
-            lo, hi = span
-            parts.append(f"{name} min {lo:g} max {hi:g}")
-        self.stats_label.setText(
-            "   ".join(parts) if parts else "No numeric samples in this time range"
+    def _sync_plot(self):
+        reset = self._fit_on_next
+        self._fit_on_next = False
+        self.plot.set_series(
+            self._selected_series(),
+            self._current_series(),
+            self._t0,
+            self._log_end,
+            reset_view=reset,
         )
+        self._refresh_measurement_columns()
 
-    def _on_xlim_changed(self, ax):
-        if self._updating_range:
+    def _refresh_measurement_columns(self):
+        t_min, t_max = self.plot.limits()
+        cursor, diff = self.plot.cursors()
+        current = self._current_series()
+        selected = {series.key for series in self._selected_series()}
+        bold = QFont()
+        bold.setBold(True)
+        normal = QFont()
+        sorting = self.signal_table.isSortingEnabled()
+        self.signal_table.setSortingEnabled(False)
+        try:
+            for row in range(self.signal_table.rowCount()):
+                message_item = self.signal_table.item(row, COL_MESSAGE)
+                if message_item is None:
+                    continue
+                row_idx = message_item.data(Qt.UserRole + 1)
+                series = self._signals[self._row_keys[row_idx]]
+                plotted = series.key in selected
+                color = self.plot.color_for(series.message_name, series.signal_name) if plotted else None
+                swatch = self.signal_table.item(row, COL_COLOR)
+                if swatch is not None:
+                    swatch.setBackground(QColor(color) if color else QColor(Qt.transparent))
+                name_item = self.signal_table.item(row, COL_SIGNAL)
+                if name_item is not None:
+                    name_item.setFont(bold if series is current else normal)
+                if not plotted:
+                    for col in (COL_VALUE, COL_DELTA, COL_MIN, COL_MAX):
+                        self._set_cell(row, col, "")
+                    continue
+                self._set_cell(row, COL_VALUE, self._value_text(series, cursor))
+                self._set_cell(row, COL_DELTA, self._delta_text(series, cursor, diff))
+                span = numeric_minmax(series.times, series.values, t_min + self._t0, t_max + self._t0)
+                if span is None:
+                    self._set_cell(row, COL_MIN, "")
+                    self._set_cell(row, COL_MAX, "")
+                else:
+                    lo, hi = span
+                    self._set_cell(row, COL_MIN, f"{lo:g}")
+                    self._set_cell(row, COL_MAX, f"{hi:g}")
+        finally:
+            self.signal_table.setSortingEnabled(sorting)
+
+    def _value_text(self, series, rel_time):
+        if rel_time is None:
+            return ""
+        sample = self._sample_at(series, rel_time)
+        if sample is None:
+            return ""
+        return format_signal_value(sample, series.choices)
+
+    def _delta_text(self, series, start, end):
+        if start is None or end is None:
+            return ""
+        first = self._sample_at(series, start)
+        second = self._sample_at(series, end)
+        if not _is_number(first) or not _is_number(second):
+            return ""
+        return f"{second - first:g}"
+
+    def _sample_at(self, series, rel_time):
+        index = nearest_index(series.times, rel_time + self._t0)
+        if index is None:
+            return None
+        return series.values[index]
+
+    def _set_cell(self, row: int, col: int, text: str):
+        item = self.signal_table.item(row, col)
+        if item is None:
             return
-        xmin, xmax = ax.get_xlim()
-        self._updating_range = True
-        self.range_from.setValue(max(0.0, xmin))
-        self.range_to.setValue(max(0.0, xmax))
-        self._updating_range = False
-        self._style_markers(xmin, xmax)
-        self._update_stats(xmin, xmax)
-        self.canvas.draw_idle()
+        if item.text() != text:
+            item.setText(text)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)

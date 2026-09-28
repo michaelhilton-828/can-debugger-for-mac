@@ -10,7 +10,10 @@ change, since data arrives continuously rather than being decoded once.
 
 from __future__ import annotations
 
+import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -25,6 +28,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -36,23 +41,47 @@ from PySide6.QtWidgets import (
 )
 
 from .dbc_model import DbcLoadError, format_id_hex, load_database
-from .live_capture_model import BusConfig, LiveSignalBuffer, build_bus_kwargs
+from .live_capture_model import BusConfig, DecodeDatabase, LiveSignalBuffer, build_bus_kwargs
 from .live_capture_worker import LiveCaptureWorker
 from .log_replay_model import enum_ticks
 
-SIGNAL_HEADERS = ["Message", "Signal", "Unit", "ID (hex)", "Samples"]
+SIGNAL_HEADERS = ["DBC", "Message", "Signal", "Unit", "ID (hex)", "Samples"]
+SAMPLES_COL = SIGNAL_HEADERS.index("Samples")
 CLASSIC_BITRATES = [125_000, 250_000, 500_000, 1_000_000]
 REDRAW_INTERVAL_MS = 100  # 10 Hz
+MAX_DBCS = 5
+
+
+def _same_path(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+@dataclass
+class _LoadedDbc:
+    database: object
+    path: str
+    follows_viewer: bool = False
+
+    @property
+    def label(self) -> str:
+        return Path(self.path).name
+
+    @property
+    def display(self) -> str:
+        if self.follows_viewer:
+            return f"{self.label}  (from DBC Viewer)"
+        return self.label
 
 
 class LiveSignalViewerTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.database = None
+        self._dbcs: list[_LoadedDbc] = []
         self._browser_database = None
         self._browser_database_path = ""
-        self._independent_dbc_path = ""
-        self._using_independent_dbc = False
+        self._follow_viewer = True
 
         self._buffers: dict[tuple[str, str], LiveSignalBuffer] = {}
         self._row_keys: list[tuple[str, str]] = []
@@ -66,7 +95,7 @@ class LiveSignalViewerTab(QWidget):
         self._session_active = False
 
         self._build_ui()
-        self._update_dbc_label()
+        self._refresh_dbc_list()
         self._on_mode_changed(self.mode_combo.currentIndex())
 
         self._redraw_timer = QTimer(self)
@@ -79,17 +108,30 @@ class LiveSignalViewerTab(QWidget):
         root = QVBoxLayout(self)
 
         dbc_row = QHBoxLayout()
-        self.dbc_label = QLabel("No DBC loaded")
-        self.dbc_label.setStyleSheet("color: #555;")
-        self.dbc_open_button = QPushButton("Open .dbc…")
-        self.dbc_open_button.clicked.connect(self._open_dbc_dialog)
+        self.dbc_count_label = QLabel(f"DBC files (0/{MAX_DBCS})")
+        self.add_dbc_button = QPushButton("Add another DBC…")
+        self.add_dbc_button.setToolTip(f"Add a DBC file. At most {MAX_DBCS} can be loaded.")
+        self.add_dbc_button.clicked.connect(self._add_dbc_dialog)
+        self.remove_dbc_button = QPushButton("Remove")
+        self.remove_dbc_button.clicked.connect(self._remove_selected_dbc)
         self.dbc_use_browser_button = QPushButton("Use DBC Viewer tab's DBC")
         self.dbc_use_browser_button.clicked.connect(self._use_browser_dbc)
         self.dbc_use_browser_button.setEnabled(False)
-        dbc_row.addWidget(self.dbc_label, 1)
-        dbc_row.addWidget(self.dbc_open_button)
+        dbc_row.addWidget(self.dbc_count_label)
+        dbc_row.addStretch(1)
+        dbc_row.addWidget(self.add_dbc_button)
+        dbc_row.addWidget(self.remove_dbc_button)
         dbc_row.addWidget(self.dbc_use_browser_button)
         root.addLayout(dbc_row)
+
+        self.dbc_list = QListWidget()
+        self.dbc_list.setMaximumHeight(96)
+        self.dbc_list.setToolTip(
+            "Loaded DBC files, up to 5. If two files define the same CAN ID, "
+            "the one higher in this list is used to decode it."
+        )
+        self.dbc_list.currentRowChanged.connect(self._on_dbc_row_changed)
+        root.addWidget(self.dbc_list)
 
         conn_row = QHBoxLayout()
         conn_row.addWidget(QLabel("Channel:"))
@@ -218,51 +260,141 @@ class LiveSignalViewerTab(QWidget):
     # -------------------------------------------------------------- DBC sync
 
     def set_browser_database(self, database, path: str) -> None:
-        """Slot for BrowserTab.database_loaded - identical logic to
-        LogReplayTab.set_browser_database. Never affects a session already
-        connected; a new connection always uses whatever DBC is current
-        when Connect is clicked."""
+        """Slot for BrowserTab.database_loaded.
+
+        The viewer file occupies one slot and stays current until the user
+        removes it. A connection already in progress keeps the databases it
+        started with; the list updates for the next Connect.
+        """
         self._browser_database = database
         self._browser_database_path = path
-        self.dbc_use_browser_button.setEnabled(self._using_independent_dbc)
-        if not self._using_independent_dbc:
-            self._set_database(database)
-        self._update_dbc_label()
-
-    def _update_dbc_label(self):
-        if self.database is None:
-            self.dbc_label.setText("No DBC loaded")
-        elif self._using_independent_dbc:
-            self.dbc_label.setText(f"{self._independent_dbc_path} (independent)")
+        if self._follow_viewer and self._worker is None:
+            self._upsert_viewer_slot()
         else:
-            self.dbc_label.setText(f"{self._browser_database_path} (from DBC Viewer tab)")
+            self._refresh_dbc_list()
 
-    def _open_dbc_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
-        if not path:
-            return
-        try:
-            database = load_database(path)
-        except DbcLoadError as exc:
-            QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
-            return
+    def _viewer_slot(self) -> _LoadedDbc | None:
+        for slot in self._dbcs:
+            if slot.follows_viewer or _same_path(slot.path, self._browser_database_path):
+                return slot
+        return None
 
-        self._independent_dbc_path = path
-        self._using_independent_dbc = True
-        self._set_database(database)
-        self.dbc_use_browser_button.setEnabled(True)
-        self._update_dbc_label()
+    def _upsert_viewer_slot(self):
+        if self._browser_database is None:
+            self._refresh_dbc_list()
+            return
+        existing = self._viewer_slot()
+        if existing is not None:
+            existing.database = self._browser_database
+            existing.path = self._browser_database_path
+            existing.follows_viewer = True
+            self._refresh_after_dbc_change()
+            return
+        if len(self._dbcs) >= MAX_DBCS:
+            self._refresh_dbc_list()
+            return
+        self._dbcs.insert(
+            0,
+            _LoadedDbc(self._browser_database, self._browser_database_path, follows_viewer=True),
+        )
+        self._refresh_after_dbc_change()
+
+    def _add_dbc_dialog(self):
+        if len(self._dbcs) >= MAX_DBCS:
+            QMessageBox.information(
+                self,
+                "DBC limit reached",
+                f"A maximum of {MAX_DBCS} DBC files can be loaded. Remove one to add another.",
+            )
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add DBC files", "", "CAN database (*.dbc);;All files (*)"
+        )
+        if not paths:
+            return
+        added = 0
+        duplicates = 0
+        stopped_early = False
+        for path in paths:
+            if len(self._dbcs) >= MAX_DBCS:
+                stopped_early = True
+                break
+            if any(_same_path(slot.path, path) for slot in self._dbcs):
+                duplicates += 1
+                continue
+            try:
+                database = load_database(path)
+            except DbcLoadError as exc:
+                QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
+                continue
+            self._dbcs.append(_LoadedDbc(database, path, follows_viewer=False))
+            added += 1
+        if stopped_early:
+            QMessageBox.information(
+                self,
+                "DBC limit reached",
+                f"Stopped at {MAX_DBCS} DBC files. Extra selections were not loaded.",
+            )
+        elif added == 0 and duplicates:
+            QMessageBox.information(self, "Already loaded", "Those DBC files are already in the list.")
+        if added:
+            self._refresh_after_dbc_change()
+        else:
+            self._refresh_dbc_list()
+
+    def _remove_selected_dbc(self):
+        row = self.dbc_list.currentRow()
+        if row < 0 or row >= len(self._dbcs):
+            return
+        removed = self._dbcs.pop(row)
+        if removed.follows_viewer:
+            self._follow_viewer = False
+        self._refresh_after_dbc_change()
 
     def _use_browser_dbc(self):
-        self._using_independent_dbc = False
-        self._set_database(self._browser_database)
-        self.dbc_use_browser_button.setEnabled(False)
-        self._update_dbc_label()
+        if self._browser_database is None:
+            return
+        if self._viewer_slot() is None and len(self._dbcs) >= MAX_DBCS:
+            QMessageBox.information(
+                self,
+                "DBC limit reached",
+                f"Remove a DBC file first. The maximum is {MAX_DBCS}.",
+            )
+            return
+        self._follow_viewer = True
+        self._upsert_viewer_slot()
 
-    def _set_database(self, database):
-        self.database = database
+    def _on_dbc_row_changed(self, _row: int):
+        self.remove_dbc_button.setEnabled(self._worker is None and self.dbc_list.currentRow() >= 0)
+
+    def _refresh_dbc_list(self):
+        selected = self.dbc_list.currentRow()
+        self.dbc_list.blockSignals(True)
+        self.dbc_list.clear()
+        for slot in self._dbcs:
+            item = QListWidgetItem(slot.display)
+            item.setToolTip(slot.path)
+            self.dbc_list.addItem(item)
+        if 0 <= selected < self.dbc_list.count():
+            self.dbc_list.setCurrentRow(selected)
+        self.dbc_list.blockSignals(False)
+        self.dbc_count_label.setText(f"DBC files ({len(self._dbcs)}/{MAX_DBCS})")
+        editable = self._worker is None
+        self.add_dbc_button.setEnabled(editable and len(self._dbcs) < MAX_DBCS)
+        self.remove_dbc_button.setEnabled(editable and self.dbc_list.currentRow() >= 0)
+        viewer_missing = self._browser_database is not None and self._viewer_slot() is None
+        self.dbc_use_browser_button.setEnabled(editable and viewer_missing)
+
+    def _refresh_after_dbc_change(self):
+        self._refresh_dbc_list()
         if self._worker is None:
             self._rebuild_signal_catalog()
+
+    def _decode_databases(self) -> list[DecodeDatabase]:
+        return [
+            DecodeDatabase(source_id=slot.path, label=slot.label, database=slot.database)
+            for slot in self._dbcs
+        ]
 
     # ------------------------------------------------------------ connection
 
@@ -278,8 +410,8 @@ class LiveSignalViewerTab(QWidget):
         )
 
     def _on_connect_clicked(self):
-        if self.database is None:
-            QMessageBox.warning(self, "No DBC loaded", "Load a .dbc file before connecting.")
+        if not self._dbcs:
+            QMessageBox.warning(self, "No DBC loaded", "Add a .dbc file before connecting.")
             return
 
         config = self._read_bus_config()
@@ -293,7 +425,7 @@ class LiveSignalViewerTab(QWidget):
         self.figure.clear()
         self.canvas.draw_idle()
 
-        self._worker = LiveCaptureWorker(bus_kwargs, self.database)
+        self._worker = LiveCaptureWorker(bus_kwargs, self._decode_databases())
         self._worker.connected.connect(self._on_connected)
         self._worker.samples_ready.connect(self._on_samples_ready)
         self._worker.traffic_counts.connect(self._on_traffic_counts)
@@ -362,6 +494,10 @@ class LiveSignalViewerTab(QWidget):
         self.mode_combo.setEnabled(False)
         self.classic_bitrate_combo.setEnabled(False)
         self.fd_row.setEnabled(False)
+        self.add_dbc_button.setEnabled(False)
+        self.remove_dbc_button.setEnabled(False)
+        self.dbc_use_browser_button.setEnabled(False)
+        self.dbc_list.setEnabled(False)
         self.status_label.setText("Connecting…")
 
     def _set_ui_disconnected(self):
@@ -372,6 +508,8 @@ class LiveSignalViewerTab(QWidget):
         self.mode_combo.setEnabled(True)
         self.classic_bitrate_combo.setEnabled(True)
         self.fd_row.setEnabled(True)
+        self.dbc_list.setEnabled(True)
+        self._refresh_dbc_list()
 
     def _clear_pause(self):
         self._paused = False
@@ -384,31 +522,31 @@ class LiveSignalViewerTab(QWidget):
 
     def _rebuild_signal_catalog(self):
         """List every DBC signal immediately, with a zero sample count until traffic arrives."""
-        selected = {
-            (buf.message_name, buf.signal_name)
-            for buf in self._selected_series()
-        } if self._row_keys else set()
+        selected = {buf.key for buf in self._selected_series()} if self._row_keys else set()
         self._buffers = {}
         self._row_keys = []
         self.signal_table.setSortingEnabled(False)
         self.signal_table.setRowCount(0)
-        if self.database is None:
+        if not self._dbcs:
             self.signal_table.setSortingEnabled(True)
             return
         keys = []
-        for msg in self.database.messages:
-            for sig in msg.signals:
-                key = (msg.name, sig.name)
-                if key in self._buffers:
-                    continue
-                self._buffers[key] = LiveSignalBuffer(
-                    message_name=msg.name,
-                    signal_name=sig.name,
-                    arbitration_id=msg.frame_id,
-                    unit=sig.unit or "",
-                    choices=sig.choices or {},
-                )
-                keys.append(key)
+        for slot in self._dbcs:
+            for msg in slot.database.messages:
+                for sig in msg.signals:
+                    key = (slot.path, msg.name, sig.name)
+                    if key in self._buffers:
+                        continue
+                    self._buffers[key] = LiveSignalBuffer(
+                        message_name=msg.name,
+                        signal_name=sig.name,
+                        arbitration_id=msg.frame_id,
+                        unit=sig.unit or "",
+                        source_id=slot.path,
+                        dbc_label=slot.label,
+                        choices=sig.choices or {},
+                    )
+                    keys.append(key)
         self._append_signal_rows(keys)
         if selected:
             self._restore_selection(selected)
@@ -425,7 +563,7 @@ class LiveSignalViewerTab(QWidget):
             if item is None:
                 continue
             row_idx = item.data(Qt.UserRole + 1)
-            if self._row_keys[row_idx] in keys:
+            if self._buffers[self._row_keys[row_idx]].key in keys:
                 index = self.signal_table.model().index(r, 0)
                 model.select(index, flags)
         self.signal_table.blockSignals(False)
@@ -452,6 +590,8 @@ class LiveSignalViewerTab(QWidget):
                     signal_name=s.signal_name,
                     arbitration_id=s.arbitration_id,
                     unit=s.unit,
+                    source_id=s.source_id,
+                    dbc_label=s.dbc_label,
                     choices=s.choices,
                 )
                 self._buffers[key] = buf
@@ -473,6 +613,7 @@ class LiveSignalViewerTab(QWidget):
             self._row_keys.append(key)
             buf = self._buffers[key]
             values = [
+                buf.dbc_label,
                 buf.message_name,
                 buf.signal_name,
                 buf.unit,
@@ -490,8 +631,8 @@ class LiveSignalViewerTab(QWidget):
         text = text.strip().lower()
         for r in range(self.signal_table.rowCount()):
             row_idx = self.signal_table.item(r, 0).data(Qt.UserRole + 1)
-            key = self._row_keys[row_idx]
-            haystack = f"{key[0]} {key[1]}".lower()
+            buf = self._buffers[self._row_keys[row_idx]]
+            haystack = f"{buf.dbc_label} {buf.message_name} {buf.signal_name}".lower()
             self.signal_table.setRowHidden(r, text not in haystack)
 
     def _selected_series(self):
@@ -508,7 +649,7 @@ class LiveSignalViewerTab(QWidget):
     def _update_sample_counts(self):
         for r in range(self.signal_table.rowCount()):
             item = self.signal_table.item(r, 0)
-            count_item = self.signal_table.item(r, 4)
+            count_item = self.signal_table.item(r, SAMPLES_COL)
             if item is None or count_item is None:
                 continue
             row_idx = item.data(Qt.UserRole + 1)
