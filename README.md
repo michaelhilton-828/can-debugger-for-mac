@@ -59,8 +59,8 @@ Live Signal Viewer can each add more DBC files, up to five.
 ## Setup
 
 ```bash
-git clone git@github.com:michaelhilton-828/dbc-viewer.git
-cd dbc-viewer
+git clone git@github.com:michaelhilton-828/can-debugger-for-mac.git
+cd can-debugger-for-mac
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
