@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .theme import GROUP_BORDER, GROUP_FILL
 from .log_replay_model import (
     enum_ticks,
     format_signal_value,
@@ -174,9 +175,6 @@ class ToolGroup(QFrame):
         self.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred)
         self.title_label = QLabel(title, self)
         self.title_label.setObjectName("plotToolGroupTitle")
-        self.title_label.setStyleSheet(
-            "color: #666; font-size: 11px; font-weight: 600; background: transparent;"
-        )
         self.body = QWidget(self)
         self.body.setObjectName("plotToolGroupBody")
         self.flow = FlowLayout(self.body, spacing=4)
@@ -190,8 +188,8 @@ class ToolGroup(QFrame):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(QPen(QColor("#dddddd")))
-        painter.setBrush(QColor("#fafafa"))
+        painter.setPen(QPen(QColor(GROUP_BORDER)))
+        painter.setBrush(QColor(GROUP_FILL))
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
 
     def resizeEvent(self, event):
@@ -439,16 +437,10 @@ class SignalPlot(QWidget):
         button.setToolTip(tip)
         button.setCheckable(checkable)
         button.setFocusPolicy(Qt.NoFocus)
+        button.setObjectName("plotToolButton")
         button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         button.setMinimumWidth(_BTN_MIN_WIDTH)
         button.setFixedHeight(_CTRL_HEIGHT)
-        button.setStyleSheet(
-            "QPushButton { padding: 0 10px; border: 1px solid #ccc; border-radius: 3px;"
-            " background: #fff; color: #222; }"
-            "QPushButton:hover { background: #f2f2f2; }"
-            "QPushButton:checked { background: #d6e4f5; border: 1px solid #1F4B99; color: #1a1a1a; }"
-            "QPushButton:disabled { color: #8a8a8a; background: #f4f4f4; }"
-        )
         button.clicked.connect(slot)
         return button
 
@@ -457,12 +449,13 @@ class SignalPlot(QWidget):
 
     def _caption(self, text: str) -> QLabel:
         label = QLabel(text)
+        label.setObjectName("plotToolCaption")
         label.setFixedHeight(_CTRL_HEIGHT)
         label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        label.setStyleSheet("color: #333; background: transparent;")
         return label
 
     def _match_control(self, widget):
+        widget.setObjectName("plotToolControl")
         widget.setFixedHeight(_CTRL_HEIGHT)
         widget.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
 

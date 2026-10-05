@@ -30,6 +30,7 @@ from .dbc_library import DbcLibrary
 from .ui_state import remember_splitter
 from .dbc_model import format_id_hex
 from .log_plot import ElidingLabel, SignalPlot
+from .theme import set_muted
 from .table_columns import install_column_config
 from .log_replay_model import (
     LogLoadError,
@@ -77,7 +78,7 @@ class LogReplayTab(QWidget):
         root.setSpacing(6)
 
         self.dbc_label = QLabel("No DBCs loaded on Home")
-        self.dbc_label.setStyleSheet("color: #555;")
+        set_muted(self.dbc_label)
         root.addWidget(self.dbc_label)
 
         log_row = QHBoxLayout()

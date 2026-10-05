@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox, QTabWidget
 
 from dbcviewer.browser import BrowserTab
@@ -20,6 +20,7 @@ from dbcviewer.home import HomeTab
 from dbcviewer.live_signal import LiveSignalViewerTab
 from dbcviewer.log_replay import LogReplayTab
 from dbcviewer.log_replay_model import supported_log_extensions
+from dbcviewer.theme import apply_theme
 
 MAX_RECENT = 8
 
@@ -27,6 +28,9 @@ MAX_RECENT = 8
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app)
         self.setWindowTitle("DBC Viewer")
         self.resize(1300, 850)
         self.setAcceptDrops(True)
@@ -47,6 +51,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.compare_tab, "DBC Compare")
         self.tabs.addTab(self.log_replay_tab, "Log Replay")
         self.tabs.addTab(self.live_signal_tab, "Live Signal Viewer")
+        for page in (
+            self.home_tab,
+            self.browser_tab,
+            self.compare_tab,
+            self.log_replay_tab,
+            self.live_signal_tab,
+        ):
+            page.setObjectName("appPage")
         self.setCentralWidget(self.tabs)
 
         self._settings = QSettings("dbc-viewer", "DBC Viewer")
@@ -229,8 +241,94 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _icon_path() -> Path:
+    """PNG used for the Qt window icon.
+
+    Source runs resolve next to this file. A PyInstaller bundle extracts
+    datas under sys._MEIPASS (see DBC Viewer.spec).
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / "assets" / "dbc-viewer.png"
+
+
+def _apply_app_icon(app: QApplication) -> None:
+    path = _icon_path()
+    if path.is_file():
+        icon = QIcon(str(path))
+        if not icon.isNull():
+            app.setWindowIcon(icon)
+    _set_macos_dock_icon(path)
+
+
+def _set_macos_dock_icon(path: Path) -> None:
+    """Set the Dock icon when launched with ./run.sh.
+
+    The built .app takes its Dock and desktop icon from assets/dbc-viewer.icns.
+    setWindowIcon does not replace the Python Dock icon for a raw interpreter.
+    """
+    if sys.platform != "darwin" or getattr(sys, "frozen", False) or not path.is_file():
+        return
+    dock = path.with_suffix(".icns")
+    if not dock.is_file():
+        dock = path
+    try:
+        from AppKit import NSApplication, NSImage
+    except Exception:
+        NSApplication = None
+        NSImage = None
+    if NSApplication is not None and NSImage is not None:
+        try:
+            image = NSImage.alloc().initWithContentsOfFile_(str(dock))
+            if image is not None:
+                NSApplication.sharedApplication().setApplicationIconImage_(image)
+                return
+        except Exception:
+            pass
+    try:
+        _set_macos_dock_icon_cocoa(dock)
+    except Exception:
+        return
+
+
+def _set_macos_dock_icon_cocoa(path: Path) -> None:
+    """AppKit setApplicationIconImage: without a PyObjC dependency."""
+    import ctypes
+
+    objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+    ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.objc_getClass.argtypes = [ctypes.c_char_p]
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+    def selector(name: str):
+        return objc.sel_registerName(name.encode())
+
+    def message(restype, argtypes):
+        return ctypes.CFUNCTYPE(restype, *argtypes)(("objc_msgSend", objc))
+
+    void_p = ctypes.c_void_p
+    send0 = message(void_p, [void_p, void_p])
+    send_str = message(void_p, [void_p, void_p, ctypes.c_char_p])
+    send_obj = message(void_p, [void_p, void_p, void_p])
+    send_void = message(None, [void_p, void_p, void_p])
+
+    ns_application = objc.objc_getClass(b"NSApplication")
+    ns_image = objc.objc_getClass(b"NSImage")
+    ns_string = objc.objc_getClass(b"NSString")
+    if not ns_application or not ns_image or not ns_string:
+        return
+    app = send0(ns_application, selector("sharedApplication"))
+    ns_path = send_str(ns_string, selector("stringWithUTF8String:"), os.fsencode(path))
+    image = send_obj(send0(ns_image, selector("alloc")), selector("initWithContentsOfFile:"), ns_path)
+    if image:
+        send_void(app, selector("setApplicationIconImage:"), image)
+
+
 def main():
     app = QApplication(sys.argv)
+    apply_theme(app)
+    _apply_app_icon(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

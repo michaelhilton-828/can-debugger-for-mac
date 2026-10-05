@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from .dbc_library import DbcLibrary
 from .diff import compare_databases
 from .table_columns import install_column_config
+from .theme import NAVY
 
 ADDED_COLOR = QColor(0xDC, 0xF5, 0xDC)
 REMOVED_COLOR = QColor(0xF9, 0xDA, 0xDA)
@@ -60,7 +61,9 @@ class CompareTab(QWidget):
 
         self.summary_label = QLabel(_NEED_TWO)
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet("font-weight: bold; padding: 4px;")
+        self.summary_label.setStyleSheet(
+            f"color: {NAVY}; font-weight: bold; padding: 4px; background: transparent;"
+        )
         root.addWidget(self.summary_label)
 
         self.filter_edit = QLineEdit()

@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/dbc-viewer.png', 'assets')],
     hiddenimports=[
         'matplotlib.backends.backend_qtagg',
         'can.io.blf',
@@ -57,6 +57,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='DBC Viewer.app',
-    icon=None,
+    icon='assets/dbc-viewer.icns',
     bundle_identifier=None,
 )

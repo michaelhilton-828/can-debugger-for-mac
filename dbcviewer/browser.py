@@ -24,6 +24,7 @@ from .bitlayout import BitLayoutWidget
 from .dbc_library import DbcLibrary
 from .dbc_model import message_rows, signal_rows
 from .table_columns import install_column_config
+from .theme import set_muted
 from .ui_state import remember_splitter
 
 MESSAGE_HEADERS = ["Name", "ID (hex)", "ID (dec)", "DLC", "Node(s)"]
@@ -55,7 +56,7 @@ class BrowserTab(QWidget):
 
         self.path_label = QLabel("No DBC is selected on Home.")
         self.path_label.setWordWrap(True)
-        self.path_label.setStyleSheet("color: #555;")
+        set_muted(self.path_label)
         root.addWidget(self.path_label)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -82,7 +83,6 @@ class BrowserTab(QWidget):
         left_layout.addWidget(self.message_table, 1)
         self.message_detail = QLabel("Cycle time, receivers, and comment appear here.")
         self.message_detail.setWordWrap(True)
-        self.message_detail.setStyleSheet("color: #333;")
         left_layout.addWidget(self.message_detail)
         splitter.addWidget(left)
 
@@ -122,7 +122,6 @@ class BrowserTab(QWidget):
         values_layout.addWidget(self.values_label)
         self.signal_meta = QLabel("")
         self.signal_meta.setWordWrap(True)
-        self.signal_meta.setStyleSheet("color: #333;")
         values_layout.addWidget(self.signal_meta)
         self.values_table = QTableWidget(0, 2)
         self.values_table.setHorizontalHeaderLabels(["Raw value", "Label"])

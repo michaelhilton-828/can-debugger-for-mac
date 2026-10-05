@@ -57,6 +57,7 @@ from .table_columns import install_column_config
 from .ui_state import remember_splitter
 from .live_capture_worker import LiveCaptureWorker
 from .log_replay_model import enum_ticks
+from .theme import STEEL, set_muted
 
 SIGNAL_HEADERS = ["DBC", "Message", "Signal", "Unit", "ID (hex)", "Samples"]
 SAMPLES_COL = SIGNAL_HEADERS.index("Samples")
@@ -146,7 +147,7 @@ class LiveSignalViewerTab(QWidget):
         root = QVBoxLayout(self)
 
         self.dbc_label = QLabel("No DBCs loaded on Home")
-        self.dbc_label.setStyleSheet("color: #555;")
+        set_muted(self.dbc_label)
         root.addWidget(self.dbc_label)
 
         conn_row = QHBoxLayout()
@@ -208,7 +209,7 @@ class LiveSignalViewerTab(QWidget):
 
         status_row = QHBoxLayout()
         self.status_label = QLabel("Disconnected")
-        self.status_label.setStyleSheet("color: #555;")
+        set_muted(self.status_label)
         status_row.addWidget(self.status_label, 1)
         status_row.addWidget(QLabel("Window (s):"))
         self.window_spin = QSpinBox()
@@ -291,7 +292,7 @@ class LiveSignalViewerTab(QWidget):
         self.overlay_checkbox.setChecked(True)
         right_layout.addWidget(self.overlay_checkbox)
 
-        self.figure = Figure()
+        self.figure = Figure(facecolor="white")
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         right_layout.addWidget(self.toolbar)
@@ -933,7 +934,7 @@ class LiveSignalViewerTab(QWidget):
             transform=ax.transAxes,
             ha="center",
             va="center",
-            color="#666",
+            color=STEEL,
             fontsize=12,
         )
         self.figure.tight_layout()

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .dbc_library import MAX_DBCS, DbcLibrary
+from .theme import set_muted
 
 
 def _dbc_paths(mime) -> list[str]:
@@ -110,7 +111,7 @@ class HomeTab(QWidget):
             "Up to 5 files. The top file wins when CAN IDs overlap. Other tabs use this list."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #555;")
+        set_muted(hint)
         root.addWidget(hint)
 
         self.list = _DbcList(self)
