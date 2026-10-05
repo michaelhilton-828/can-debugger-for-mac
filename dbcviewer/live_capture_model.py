@@ -140,6 +140,74 @@ def classify_frame(msg, databases) -> str:
     return "data"
 
 
+@dataclass
+class FrameSnapshot:
+    """Latest view of one arbitration ID within a receive batch.
+
+    `count` is how many times this ID arrived in the batch. `data` is the
+    payload of the most recent one. The GUI adds these onto a per-ID row.
+    """
+
+    arbitration_id: int
+    is_extended: bool
+    is_fd: bool
+    bitrate_switch: bool
+    dlc: int
+    data: bytes
+    count: int = 1
+    is_error: bool = False
+    is_remote: bool = False
+
+
+def snapshot_frame(msg) -> FrameSnapshot:
+    """Copy the fields the live frames table displays off one can.Message."""
+    return FrameSnapshot(
+        arbitration_id=msg.arbitration_id,
+        is_extended=bool(msg.is_extended_id),
+        is_fd=bool(msg.is_fd),
+        bitrate_switch=bool(msg.bitrate_switch),
+        dlc=int(msg.dlc),
+        data=bytes(msg.data),
+        is_error=bool(msg.is_error_frame),
+        is_remote=bool(msg.is_remote_frame),
+    )
+
+
+def merge_snapshot(pending: dict, msg) -> None:
+    """Fold one received frame into `pending`, keyed by arbitration ID.
+
+    A later frame with the same ID replaces the displayed payload and flags
+    and increments `count`. Error frames and data frames that share an ID
+    stay on one row; the latest flags win.
+    """
+    snap = snapshot_frame(msg)
+    prev = pending.get(snap.arbitration_id)
+    if prev is None:
+        pending[snap.arbitration_id] = snap
+        return
+    prev.count += snap.count
+    prev.data = snap.data
+    prev.dlc = snap.dlc
+    prev.is_extended = snap.is_extended
+    prev.is_fd = snap.is_fd
+    prev.bitrate_switch = snap.bitrate_switch
+    prev.is_error = snap.is_error
+    prev.is_remote = snap.is_remote
+
+
+def frame_type_label(snap: FrameSnapshot) -> str:
+    """Short bus-format label for one observed ID."""
+    if snap.is_error:
+        return "Error"
+    if snap.is_remote:
+        return "Remote"
+    if snap.is_fd and snap.bitrate_switch:
+        return "FD+BRS"
+    if snap.is_fd:
+        return "FD"
+    return "CAN"
+
+
 def decode_frame(msg, databases) -> list[DecodedSample]:
     """Decode one received can.Message against one or more databases.
 

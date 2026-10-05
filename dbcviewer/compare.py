@@ -1,71 +1,65 @@
-"""Compare tab: load two .dbc files and show a side-by-side structural diff."""
+"""Compare tab: pick two loaded DBC files and show a structural diff."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QFileDialog,
-    QGridLayout,
+    QComboBox,
+    QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QMessageBox,
-    QPushButton,
+    QSizePolicy,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .dbc_model import DbcLoadError, load_database
+from .dbc_library import DbcLibrary
 from .diff import compare_databases
+from .table_columns import install_column_config
 
 ADDED_COLOR = QColor(0xDC, 0xF5, 0xDC)
 REMOVED_COLOR = QColor(0xF9, 0xDA, 0xDA)
 CHANGED_COLOR = QColor(0xFC, 0xF1, 0xC7)
 
+_NEED_TWO = "Fewer than two DBC files are loaded. Add them on the Home tab."
+_NEED_DIFFERENT = "Choose two different files."
+
 
 class CompareTab(QWidget):
     # (message name, signal name or "") — double-click in the diff tree.
     open_in_viewer = Signal(str, str)
-    dbc_loaded = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, library: DbcLibrary, parent=None):
         super().__init__(parent)
+        self.library = library
         self.database_a = None
         self.database_b = None
-        self._browser_database = None
-        self._browser_path = ""
-        self._file_a_explicit = False
+        self._user_picked = False
+        self._path_a = ""
+        self._path_b = ""
+        self._compared: tuple[str, str] | None = None
         self._build_ui()
+        self.library.changed.connect(self._on_library_changed)
+        self._on_library_changed()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        grid = QGridLayout()
-        self.button_a = QPushButton("Open File A…")
-        self.button_a.clicked.connect(lambda: self._open_file("a"))
-        self.label_a = QLabel("No file loaded")
-        self.button_b = QPushButton("Open File B…")
-        self.button_b.clicked.connect(lambda: self._open_file("b"))
-        self.label_b = QLabel("No file loaded")
-        self.compare_button = QPushButton("Compare →")
-        self.compare_button.clicked.connect(self._run_compare)
-        self.compare_button.setEnabled(False)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("File A"))
+        self.combo_a = self._make_combo()
+        row.addWidget(self.combo_a, 1)
+        row.addWidget(QLabel("File B"))
+        self.combo_b = self._make_combo()
+        row.addWidget(self.combo_b, 1)
+        root.addLayout(row)
 
-        self.use_viewer_button = QPushButton("Use viewer DBC")
-        self.use_viewer_button.setEnabled(False)
-        self.use_viewer_button.clicked.connect(self._use_viewer_dbc)
-
-        grid.addWidget(self.button_a, 0, 0)
-        grid.addWidget(self.label_a, 0, 1)
-        grid.addWidget(self.use_viewer_button, 0, 2)
-        grid.addWidget(self.button_b, 1, 0)
-        grid.addWidget(self.label_b, 1, 1)
-        grid.addWidget(self.compare_button, 0, 3, 2, 1)
-        root.addLayout(grid)
-
-        self.summary_label = QLabel("Load two files and click Compare.")
+        self.summary_label = QLabel(_NEED_TWO)
+        self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet("font-weight: bold; padding: 4px;")
         root.addWidget(self.summary_label)
 
@@ -79,52 +73,92 @@ class CompareTab(QWidget):
         self.tree.setColumnWidth(0, 380)
         self.tree.setToolTip("Double-click a message or signal to open it in the DBC Viewer tab.")
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        install_column_config(self.tree, "compare.diff")
+        self.tree.header().setSectionResizeMode(QHeaderView.Interactive)
         root.addWidget(self.tree, 1)
 
-    def set_browser_database(self, database, path: str) -> None:
-        """Seed File A from the DBC Viewer tab until the user picks File A explicitly."""
-        self._browser_database = database
-        self._browser_path = path
-        self.use_viewer_button.setEnabled(database is not None)
-        if not self._file_a_explicit:
-            self.database_a = database
-            self.label_a.setText(f"{path}  (from DBC Viewer)")
-            self._sync_compare_button()
+    def _make_combo(self) -> QComboBox:
+        combo = QComboBox()
+        combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        combo.setMinimumContentsLength(16)
+        combo.currentIndexChanged.connect(self._on_combo_changed)
+        return combo
 
-    def load_path(self, which: str, path: str) -> bool:
-        """Load `path` as File A or File B. Used by the file dialog and by drops."""
-        try:
-            db = load_database(path)
-        except DbcLoadError as exc:
-            QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
-            return False
-
-        if which == "a":
-            self._file_a_explicit = True
-            self.database_a = db
-            self.label_a.setText(path)
+    def _on_library_changed(self):
+        entries = self.library.entries()
+        paths = [entry.path for entry in entries]
+        self._fill_combos(entries)
+        if self._user_picked and self._path_a in paths and self._path_b in paths:
+            self._set_combo(self.combo_a, self._path_a)
+            self._set_combo(self.combo_b, self._path_b)
+        elif len(entries) >= 2:
+            self._user_picked = False
+            self._path_a = entries[0].path
+            self._path_b = entries[1].path
+            self._set_combo(self.combo_a, self._path_a)
+            self._set_combo(self.combo_b, self._path_b)
+        elif len(entries) == 1:
+            self._user_picked = False
+            self._path_a = entries[0].path
+            self._path_b = ""
+            self._set_combo(self.combo_a, self._path_a)
         else:
-            self.database_b = db
-            self.label_b.setText(path)
-        self._sync_compare_button()
-        self.dbc_loaded.emit(path)
-        return True
+            self._user_picked = False
+            self._path_a = ""
+            self._path_b = ""
+        self._maybe_compare()
 
-    def _use_viewer_dbc(self):
-        if self._browser_database is None:
+    def _fill_combos(self, entries):
+        for combo in (self.combo_a, self.combo_b):
+            combo.blockSignals(True)
+            combo.clear()
+            for entry in entries:
+                combo.addItem(entry.label, entry.path)
+                combo.setItemData(combo.count() - 1, entry.path, Qt.ToolTipRole)
+            combo.blockSignals(False)
+
+    def _set_combo(self, combo: QComboBox, path: str) -> None:
+        combo.blockSignals(True)
+        index = combo.findData(path) if path else -1
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        combo.setToolTip(combo.currentData() or "")
+
+    def _on_combo_changed(self, _index: int = 0):
+        self._user_picked = True
+        self._path_a = self.combo_a.currentData() or ""
+        self._path_b = self.combo_b.currentData() or ""
+        self.combo_a.setToolTip(self._path_a)
+        self.combo_b.setToolTip(self._path_b)
+        self._maybe_compare()
+
+    def _maybe_compare(self):
+        entries = self.library.entries()
+        if len(entries) < 2:
+            self.database_a = None
+            self.database_b = None
+            self._compared = None
+            self.summary_label.setText(_NEED_TWO)
+            self.tree.clear()
             return
-        self._file_a_explicit = False
-        self.database_a = self._browser_database
-        self.label_a.setText(f"{self._browser_path}  (from DBC Viewer)")
-        self._sync_compare_button()
-
-    def _sync_compare_button(self):
-        self.compare_button.setEnabled(self.database_a is not None and self.database_b is not None)
-
-    def _open_file(self, which: str):
-        path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
-        if path:
-            self.load_path(which, path)
+        if not self._path_a or not self._path_b or self._path_a == self._path_b:
+            self.database_a = None
+            self.database_b = None
+            self._compared = None
+            self.summary_label.setText(_NEED_DIFFERENT)
+            self.tree.clear()
+            return
+        pair = (self._path_a, self._path_b)
+        if pair == self._compared:
+            return
+        by_path = {entry.path: entry.database for entry in entries}
+        self.database_a = by_path.get(self._path_a)
+        self.database_b = by_path.get(self._path_b)
+        if self.database_a is None or self.database_b is None:
+            return
+        self._run_compare()
+        self._compared = pair
 
     def _run_compare(self):
         diff = compare_databases(self.database_a, self.database_b)

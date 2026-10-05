@@ -11,10 +11,12 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QTabWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox, QTabWidget
 
 from dbcviewer.browser import BrowserTab
 from dbcviewer.compare import CompareTab
+from dbcviewer.dbc_library import DbcLibrary
+from dbcviewer.home import HomeTab
 from dbcviewer.live_signal import LiveSignalViewerTab
 from dbcviewer.log_replay import LogReplayTab
 from dbcviewer.log_replay_model import supported_log_extensions
@@ -29,11 +31,18 @@ class MainWindow(QMainWindow):
         self.resize(1300, 850)
         self.setAcceptDrops(True)
 
+        self.library = DbcLibrary(self)
+        self._known_dbc_paths = {
+            os.path.normcase(os.path.abspath(entry.path)) for entry in self.library.entries()
+        }
+
         self.tabs = QTabWidget()
-        self.browser_tab = BrowserTab()
-        self.compare_tab = CompareTab()
-        self.log_replay_tab = LogReplayTab()
-        self.live_signal_tab = LiveSignalViewerTab()
+        self.home_tab = HomeTab(self.library)
+        self.browser_tab = BrowserTab(self.library)
+        self.compare_tab = CompareTab(self.library)
+        self.log_replay_tab = LogReplayTab(self.library)
+        self.live_signal_tab = LiveSignalViewerTab(self.library)
+        self.tabs.addTab(self.home_tab, "Home")
         self.tabs.addTab(self.browser_tab, "DBC Viewer")
         self.tabs.addTab(self.compare_tab, "DBC Compare")
         self.tabs.addTab(self.log_replay_tab, "Log Replay")
@@ -42,11 +51,7 @@ class MainWindow(QMainWindow):
 
         self._settings = QSettings("dbc-viewer", "DBC Viewer")
 
-        self.browser_tab.database_loaded.connect(self.log_replay_tab.set_browser_database)
-        self.browser_tab.database_loaded.connect(self.live_signal_tab.set_browser_database)
-        self.browser_tab.database_loaded.connect(self.compare_tab.set_browser_database)
-        self.browser_tab.database_loaded.connect(lambda _db, path: self._remember("recent_dbc", path))
-        self.compare_tab.dbc_loaded.connect(lambda path: self._remember("recent_dbc", path))
+        self.library.changed.connect(self._remember_new_dbcs)
         self.compare_tab.open_in_viewer.connect(self._open_in_viewer)
         self.log_replay_tab.log_loaded.connect(lambda path: self._remember("recent_log", path))
 
@@ -57,7 +62,7 @@ class MainWindow(QMainWindow):
 
         open_action = QAction("&Open .dbc…", self)
         open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self.browser_tab.open_file_dialog)
+        open_action.triggered.connect(self._open_dbc_dialog)
         file_menu.addAction(open_action)
 
         self.recent_menu = file_menu.addMenu("Open &Recent")
@@ -134,8 +139,7 @@ class MainWindow(QMainWindow):
             self._forget(key, path)
             return
         if key == "recent_dbc":
-            self.tabs.setCurrentWidget(self.browser_tab)
-            self.browser_tab.load_file(path)
+            self._open_dbcs([path])
         else:
             self.tabs.setCurrentWidget(self.log_replay_tab)
             self.log_replay_tab.load_log_file(path)
@@ -144,6 +148,46 @@ class MainWindow(QMainWindow):
         self._settings.setValue("recent_dbc", "[]")
         self._settings.setValue("recent_log", "[]")
         self._rebuild_recent_menu()
+
+    def _open_dbc_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)"
+        )
+        if paths:
+            self._open_dbcs(paths)
+
+    def _open_dbcs(self, paths):
+        """Add DBC files to the shared library and show them in the viewer."""
+        before = {
+            os.path.normcase(os.path.abspath(entry.path)) for entry in self.library.entries()
+        }
+        self.library.add_paths(paths)
+        self.tabs.setCurrentWidget(self.browser_tab)
+        target = None
+        fallback = None
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            for index, entry in enumerate(self.library.entries()):
+                if os.path.normcase(os.path.abspath(entry.path)) != key:
+                    continue
+                if fallback is None:
+                    fallback = index
+                if key not in before:
+                    target = index
+                    break
+            if target is not None:
+                break
+        chosen = target if target is not None else fallback
+        if chosen is not None:
+            self.library.set_selected_index(chosen)
+
+    def _remember_new_dbcs(self):
+        for entry in self.library.entries():
+            key = os.path.normcase(os.path.abspath(entry.path))
+            if key in self._known_dbc_paths:
+                continue
+            self._known_dbc_paths.add(key)
+            self._remember("recent_dbc", entry.path)
 
     def _open_in_viewer(self, message_name: str, signal_name: str):
         if self.browser_tab.show_message(message_name, signal_name or None):
@@ -155,31 +199,30 @@ class MainWindow(QMainWindow):
             f"'{message_name}' is not in the DBC currently loaded in the viewer.",
         )
 
-    # --- drag-and-drop: .dbc into the viewer (or Compare, if that tab is
-    # current); a log file into Log Replay.
+    # --- drag-and-drop: .dbc files into the shared library (then the viewer);
+    # a log file into Log Replay.
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if not urls:
+        dbcs = []
+        logs = []
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if not path:
+                continue
+            lower = path.lower()
+            if lower.endswith(".dbc"):
+                dbcs.append(path)
+            elif any(lower.endswith(ext) for ext in supported_log_extensions()):
+                logs.append(path)
+        if dbcs:
+            self._open_dbcs(dbcs)
             return
-        path = urls[0].toLocalFile()
-        if not path:
-            return
-        lower = path.lower()
-        if lower.endswith(".dbc"):
-            if self.tabs.currentWidget() is self.compare_tab:
-                which = "a" if self.compare_tab.database_a is None else "b"
-                self.compare_tab.load_path(which, path)
-            else:
-                self.tabs.setCurrentWidget(self.browser_tab)
-                self.browser_tab.load_file(path)
-            return
-        if any(lower.endswith(ext) for ext in supported_log_extensions()):
+        if logs:
             self.tabs.setCurrentWidget(self.log_replay_tab)
-            self.log_replay_tab.load_log_file(path)
+            self.log_replay_tab.load_log_file(logs[0])
 
     def closeEvent(self, event):
         self.live_signal_tab.shutdown()

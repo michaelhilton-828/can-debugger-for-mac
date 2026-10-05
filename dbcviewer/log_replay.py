@@ -1,4 +1,4 @@
-"""The Log Replay tab: decode a CAN log against a .dbc and plot signals.
+"""The Log Replay tab: decode a CAN log against the Home DBC list and plot signals.
 
 Ports the decode/plot logic that used to live in the standalone
 can-log-viewer script (plot_can.py), but replaces its input()/print()
@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -25,8 +26,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .dbc_model import DbcLoadError, format_id_hex, load_database
-from .log_plot import ElidingLabel, FlowHost, SignalPlot
+from .dbc_library import DbcLibrary
+from .ui_state import remember_splitter
+from .dbc_model import format_id_hex
+from .log_plot import ElidingLabel, SignalPlot
+from .table_columns import install_column_config
 from .log_replay_model import (
     LogLoadError,
     format_signal_value,
@@ -36,37 +40,35 @@ from .log_replay_model import (
     supported_log_extensions,
 )
 
-SIGNAL_HEADERS = ["", "Message", "Signal", "Unit", "ID (hex)", "Samples", "Value", "Δ", "Min", "Max"]
+SIGNAL_HEADERS = ["Color", "DBC", "Message", "Signal", "Unit", "ID (hex)", "Samples", "Value", "Δ", "Min", "Max"]
 COL_COLOR = 0
-COL_MESSAGE = 1
-COL_SIGNAL = 2
-COL_SAMPLES = 5
-COL_VALUE = 6
-COL_DELTA = 7
-COL_MIN = 8
-COL_MAX = 9
+COL_DBC = 1
+COL_MESSAGE = 2
+COL_SIGNAL = 3
+COL_SAMPLES = 6
+COL_VALUE = 7
+COL_DELTA = 8
+COL_MIN = 9
+COL_MAX = 10
 
 
 class LogReplayTab(QWidget):
     log_loaded = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, library: DbcLibrary, parent=None):
         super().__init__(parent)
-        self.database = None
-        self._browser_database = None
-        self._browser_database_path = ""
-        self._independent_dbc_path = ""
-        self._using_independent_dbc = False
-
+        self.library = library
         self._signals = {}
         self._row_keys = []
         self._log_path = ""
+        self._decode_key: tuple[str, ...] | None = None
         self._t0 = 0.0
         self._log_end = 0.0
         self._fit_on_next = False
 
         self._build_ui()
-        self._update_dbc_label()
+        self.library.changed.connect(self._on_library_changed)
+        self._on_library_changed()
 
     # ------------------------------------------------------------------ UI
 
@@ -74,31 +76,21 @@ class LogReplayTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(6)
 
-        self._dbc_row = FlowHost()
-        self.dbc_open_button = QPushButton("Open .dbc…")
-        self.dbc_open_button.clicked.connect(self._open_dbc_dialog)
-        self.dbc_use_browser_button = QPushButton("Use DBC Viewer tab's DBC")
-        self.dbc_use_browser_button.clicked.connect(self._use_browser_dbc)
-        self.dbc_use_browser_button.setEnabled(False)
-        self.dbc_label = ElidingLabel("No DBC loaded")
+        self.dbc_label = QLabel("No DBCs loaded on Home")
         self.dbc_label.setStyleSheet("color: #555;")
-        self._dbc_row.flow.addWidget(self.dbc_open_button)
-        self._dbc_row.flow.addWidget(self.dbc_use_browser_button)
-        self._dbc_row.flow.addWidget(self.dbc_label)
-        root.addWidget(self._dbc_row)
+        root.addWidget(self.dbc_label)
 
-        self._log_row = FlowHost()
+        log_row = QHBoxLayout()
         self.log_open_button = QPushButton("Open log…")
         self.log_open_button.clicked.connect(self._open_log_dialog)
         self.redecode_button = QPushButton("Re-decode")
         self.redecode_button.setEnabled(False)
         self.redecode_button.clicked.connect(self._redecode)
         self.log_path_label = ElidingLabel("No log loaded")
-        self.log_path_label.setStyleSheet("color: #555;")
-        self._log_row.flow.addWidget(self.log_open_button)
-        self._log_row.flow.addWidget(self.redecode_button)
-        self._log_row.flow.addWidget(self.log_path_label)
-        root.addWidget(self._log_row)
+        log_row.addWidget(self.log_open_button)
+        log_row.addWidget(self.redecode_button)
+        log_row.addWidget(self.log_path_label, 1)
+        root.addLayout(log_row)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -122,11 +114,10 @@ class LogReplayTab(QWidget):
         self.signal_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.signal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         header = self.signal_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setSectionResizeMode(COL_SIGNAL, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_COLOR, QHeaderView.Fixed)
-        self.signal_table.setColumnWidth(COL_COLOR, 28)
+        self.signal_table.setColumnWidth(COL_COLOR, 56)
+        self.signal_table.setColumnWidth(COL_DBC, 110)
         self.signal_table.setColumnWidth(COL_MESSAGE, 120)
+        self.signal_table.setColumnWidth(COL_SIGNAL, 160)
         self.signal_table.setColumnWidth(COL_SAMPLES, 72)
         self.signal_table.setColumnWidth(COL_VALUE, 88)
         self.signal_table.setColumnWidth(COL_DELTA, 72)
@@ -134,6 +125,9 @@ class LogReplayTab(QWidget):
         self.signal_table.setColumnWidth(COL_MAX, 72)
         self.signal_table.setSortingEnabled(True)
         self.signal_table.itemSelectionChanged.connect(self._on_selection_changed)
+        install_column_config(self.signal_table, "log.signals")
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(COL_COLOR, QHeaderView.Fixed)
         left_layout.addWidget(self.signal_table, 1)
         left.setMinimumWidth(180)
         splitter.addWidget(left)
@@ -147,69 +141,33 @@ class LogReplayTab(QWidget):
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
-        self._flow_rows = (self._dbc_row, self._log_row)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        for row in self._flow_rows:
-            height = row.heightForWidth(max(1, row.width()))
-            if height > 0 and row.height() != height:
-                row.setFixedHeight(height)
+        remember_splitter(splitter, "log.signals-plot")
 
     # -------------------------------------------------------------- DBC sync
 
-    def set_browser_database(self, database, path: str) -> None:
-        """Slot for BrowserTab.database_loaded. Updates the shared DBC
-        pointer unless the user has picked an independent DBC here. Never
-        re-decodes an already-loaded log on its own - that could be an
-        expensive silent operation, so we just flag the log as possibly
-        stale and let the user re-open it if they want a fresh decode.
-        """
-        self._browser_database = database
-        self._browser_database_path = path
-        self.dbc_use_browser_button.setEnabled(self._using_independent_dbc)
-        if not self._using_independent_dbc:
-            self.database = database
-            self._mark_log_stale()
-        self._update_redecode_enabled()
-        self._update_dbc_label()
+    def _source_key(self) -> tuple[str, ...]:
+        return tuple(entry.path for entry in self.library.entries())
+
+    def _decode_sources(self):
+        return [(entry.label, entry.database) for entry in self.library.entries()]
 
     def _update_dbc_label(self):
-        if self.database is None:
-            self.dbc_label.set_full_text("No DBC loaded")
-        elif self._using_independent_dbc:
-            self.dbc_label.set_full_text(f"{self._independent_dbc_path} (independent)")
+        entries = self.library.entries()
+        if not entries:
+            text = "No DBCs loaded on Home"
         else:
-            self.dbc_label.set_full_text(f"{self._browser_database_path} (from DBC Viewer tab)")
+            text = "DBCs from Home: " + ", ".join(entry.label for entry in entries)
+        self.dbc_label.setText(text)
+        self.dbc_label.setToolTip(text)
 
-    def _open_dbc_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
-        if not path:
-            return
-        try:
-            database = load_database(path)
-        except DbcLoadError as exc:
-            QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
-            return
-
-        self._independent_dbc_path = path
-        self._using_independent_dbc = True
-        self.database = database
-        self.dbc_use_browser_button.setEnabled(True)
-        self._mark_log_stale()
-        self._update_redecode_enabled()
+    def _on_library_changed(self):
         self._update_dbc_label()
-
-    def _use_browser_dbc(self):
-        self._using_independent_dbc = False
-        self.database = self._browser_database
-        self.dbc_use_browser_button.setEnabled(False)
-        self._mark_log_stale()
         self._update_redecode_enabled()
-        self._update_dbc_label()
+        if self._log_path and self._signals and self._source_key() != self._decode_key:
+            self._mark_log_stale()
 
     def _update_redecode_enabled(self):
-        self.redecode_button.setEnabled(bool(self._log_path) and self.database is not None)
+        self.redecode_button.setEnabled(bool(self._log_path) and bool(self.library.entries()))
 
     def _mark_log_stale(self):
         if not self._log_path or not self._signals:
@@ -231,17 +189,22 @@ class LogReplayTab(QWidget):
 
     def load_log_file(self, path: str) -> bool:
         """Decode `path` against the current DBC. Public for drops and Open Recent."""
-        if self.database is None:
-            QMessageBox.warning(self, "No DBC loaded", "Load a .dbc file before opening a log.")
+        if not self.library.entries():
+            QMessageBox.warning(
+                self,
+                "No DBC loaded",
+                "Add a .dbc file on the Home tab before opening a log.",
+            )
             return False
 
         try:
-            signals, unmapped_ids = load_log(path, self.database)
+            signals, unmapped_ids = load_log(path, self._decode_sources())
         except LogLoadError as exc:
             QMessageBox.critical(self, "Failed to load log file", str(exc))
             return False
 
         self._log_path = path
+        self._decode_key = self._source_key()
         self.log_path_label.set_full_text(path)
         self._signals = signals
         stamped = [s.times[0] for s in signals.values() if s.times]
@@ -251,7 +214,13 @@ class LogReplayTab(QWidget):
             if series.times:
                 self._log_end = max(self._log_end, max(series.times) - self._t0)
         self._row_keys = sorted(
-            signals.keys(), key=lambda k: (signals[k].arbitration_id, k[0], k[1])
+            signals.keys(),
+            key=lambda k: (
+                signals[k].arbitration_id,
+                signals[k].dbc_label,
+                signals[k].message_name,
+                signals[k].signal_name,
+            ),
         )
         self._populate_signal_table()
         self._fit_on_next = True
@@ -279,6 +248,7 @@ class LogReplayTab(QWidget):
             series = self._signals[key]
             values = [
                 "",
+                series.dbc_label,
                 series.message_name,
                 series.signal_name,
                 series.unit,
@@ -299,8 +269,8 @@ class LogReplayTab(QWidget):
         text = text.strip().lower()
         for r in range(self.signal_table.rowCount()):
             row_idx = self.signal_table.item(r, COL_MESSAGE).data(Qt.UserRole + 1)
-            key = self._row_keys[row_idx]
-            haystack = f"{key[0]} {key[1]}".lower()
+            series = self._signals[self._row_keys[row_idx]]
+            haystack = f"{series.dbc_label} {series.message_name} {series.signal_name}".lower()
             self.signal_table.setRowHidden(r, text not in haystack)
 
     def _selected_series(self):
@@ -360,7 +330,7 @@ class LogReplayTab(QWidget):
                 row_idx = message_item.data(Qt.UserRole + 1)
                 series = self._signals[self._row_keys[row_idx]]
                 plotted = series.key in selected
-                color = self.plot.color_for(series.message_name, series.signal_name) if plotted else None
+                color = self.plot.color_for(series.message_name, series.signal_name, series.dbc_label) if plotted else None
                 swatch = self.signal_table.item(row, COL_COLOR)
                 if swatch is not None:
                     swatch.setBackground(QColor(color) if color else QColor(Qt.transparent))

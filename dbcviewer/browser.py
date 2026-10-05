@@ -1,21 +1,17 @@
-"""The single-file browsing tab: message list, signal list, value tables,
-and the bit-layout diagram for the selected message.
+"""The browsing tab: message list, signal list, value tables, and the
+bit-layout diagram for the DBC selected on the Home tab.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QFileDialog,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
-    QPushButton,
     QScrollArea,
     QSplitter,
     QTableWidget,
@@ -25,7 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 from .bitlayout import BitLayoutWidget
-from .dbc_model import DbcLoadError, load_database, message_rows, signal_rows
+from .dbc_library import DbcLibrary
+from .dbc_model import message_rows, signal_rows
+from .table_columns import install_column_config
+from .ui_state import remember_splitter
 
 MESSAGE_HEADERS = ["Name", "ID (hex)", "ID (dec)", "DLC", "Node(s)"]
 SIGNAL_HEADERS = [
@@ -35,31 +34,29 @@ SIGNAL_HEADERS = [
 
 
 class BrowserTab(QWidget):
-    database_loaded = Signal(object, str)  # (cantools Database, file path)
-
-    def __init__(self, parent=None):
+    def __init__(self, library: DbcLibrary, parent=None):
         super().__init__(parent)
+        self.library = library
         self.database = None
         self.message_rows = []
         self.current_signal_rows = []
         self._pending_signal_name: str | None = None
         self._preserving_signal_filter = False
+        self._shown_path: str | None = None
 
         self._build_ui()
+        self.library.changed.connect(self._show_selected)
+        self._show_selected()
 
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        top_row = QHBoxLayout()
-        self.open_button = QPushButton("Open .dbc…")
-        self.open_button.clicked.connect(self.open_file_dialog)
-        self.path_label = QLabel("No file loaded")
+        self.path_label = QLabel("No DBC is selected on Home.")
+        self.path_label.setWordWrap(True)
         self.path_label.setStyleSheet("color: #555;")
-        top_row.addWidget(self.open_button)
-        top_row.addWidget(self.path_label, 1)
-        root.addLayout(top_row)
+        root.addWidget(self.path_label)
 
         splitter = QSplitter(Qt.Horizontal)
         root.addWidget(splitter, 1)
@@ -81,6 +78,7 @@ class BrowserTab(QWidget):
         self.message_table.horizontalHeader().setStretchLastSection(True)
         self.message_table.itemSelectionChanged.connect(self._on_message_selected)
         self.message_table.setSortingEnabled(True)
+        install_column_config(self.message_table, "browser.messages")
         left_layout.addWidget(self.message_table, 1)
         self.message_detail = QLabel("Cycle time, receivers, and comment appear here.")
         self.message_detail.setWordWrap(True)
@@ -110,8 +108,9 @@ class BrowserTab(QWidget):
         self.signal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.signal_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.signal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.signal_table.itemSelectionChanged.connect(self._on_signal_selected)
+        install_column_config(self.signal_table, "browser.signals")
+        self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         signals_layout.addWidget(self.signal_table, 1)
         right_splitter.addWidget(signals_box)
 
@@ -130,6 +129,7 @@ class BrowserTab(QWidget):
         self.values_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.values_table.horizontalHeader().setStretchLastSection(True)
         self.values_table.setMaximumHeight(150)
+        install_column_config(self.values_table, "browser.values")
         values_layout.addWidget(self.values_table)
         right_splitter.addWidget(values_box)
 
@@ -153,26 +153,32 @@ class BrowserTab(QWidget):
         splitter.addWidget(right_splitter)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
+        remember_splitter(splitter, "browser.messages-detail")
+        remember_splitter(right_splitter, "browser.signals-values-bits")
 
     # ------------------------------------------------------------- loading
 
-    def open_file_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open .dbc file", "", "CAN database (*.dbc);;All files (*)")
-        if path:
-            self.load_file(path)
+    def _selected_entry(self):
+        entries = self.library.entries()
+        index = self.library.selected_index()
+        if not entries or not 0 <= index < len(entries):
+            return None
+        return entries[index]
 
-    def load_file(self, path: str) -> bool:
-        try:
-            database = load_database(path)
-        except DbcLoadError as exc:
-            QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
-            return False
-
-        self.database = database
-        self.path_label.setText(path)
-        self.message_rows = message_rows(database)
-        self.message_search.clear()
-        self.signal_search.clear()
+    def _show_selected(self):
+        entry = self._selected_entry()
+        path = entry.path if entry is not None else ""
+        if path == self._shown_path:
+            return
+        self._shown_path = path
+        if entry is None:
+            self._clear_view()
+            return
+        self.database = entry.database
+        self.path_label.setText(entry.path)
+        self.path_label.setToolTip(entry.path)
+        self.message_rows = message_rows(entry.database)
+        self._reset_searches()
         self._populate_messages()
         self.current_signal_rows = []
         self._populate_signals([])
@@ -181,12 +187,33 @@ class BrowserTab(QWidget):
         self.message_table.clearSelection()
         if self.message_table.rowCount() > 0:
             self.message_table.selectRow(0)
-        self.database_loaded.emit(database, path)
-        return True
+
+    def _reset_searches(self):
+        self.message_search.blockSignals(True)
+        self.signal_search.blockSignals(True)
+        self.message_search.clear()
+        self.signal_search.clear()
+        self.message_search.blockSignals(False)
+        self.signal_search.blockSignals(False)
+        self.signal_hits.hide()
+        self.signal_hits.clear()
+
+    def _clear_view(self):
+        self.database = None
+        self.message_rows = []
+        self.current_signal_rows = []
+        self._reset_searches()
+        self._populate_messages()
+        self._populate_signals([])
+        self.bit_layout.set_message(0, [])
+        self.message_detail.setText("")
+        self.message_table.clearSelection()
+        self.path_label.setText("No DBC is selected on Home.")
+        self.path_label.setToolTip("")
 
     def show_message(self, name: str, signal_name: str | None = None, *, keep_query: bool = False) -> bool:
         """Select `name` (and optionally one of its signals). Returns False if
-        the message is not in the loaded database.
+        the message is not in the DBC selected on Home.
 
         keep_query leaves the DBC-wide search text in place (used when the
         user picks a hit from that search).

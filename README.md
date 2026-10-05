@@ -25,12 +25,13 @@ structure, compare two `.dbc` files, replay a logged CAN capture against a
   value tables, etc.). Groups stay collapsed, a filter narrows the tree, and
   double-clicking a message or signal opens it in the viewer
 - **Log Replay tab** — decode a CAN log file (any format `python-can`
-  supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) against a
-  `.dbc` and plot selected signals. The toolbar wraps as the window narrows:
-  fit all / X / Y, wheel zoom (X, Y, or both), drag-zoom, pan, scroll to
-  start or end, and undo. A measurement cursor and difference cursor fill
-  the table's value and Δ columns; min/max follow the visible window. Y axes
-  can be stacked, shared from the current signal, or separate. Re-decode
+  supports: `.asc`, `.blf`, `.csv`, `.db`, `.log`, `.mf4`, `.trc`) against
+  up to five `.dbc` files and plot selected signals. **Add another DBC…**
+  appends a file; if two files share a CAN ID, the one higher in the list is
+  used. The toolbar wraps as the window narrows and is grouped into View,
+  Layout, Measure, and Export. Left-drag zooms, right-drag pans, and the
+  wheel and Zoom buttons follow the Wheel axis mode. Drag a measurement
+  line to move it; Shift-click places the difference cursor. Re-decode
   reruns the log after a DBC change. Drop a log file on the window to open
   it here
 - **Live Signal Viewer tab** — connect to a PEAK PCAN-USB (FD) adapter over
@@ -41,9 +42,9 @@ structure, compare two `.dbc` files, replay a logged CAN capture against a
   arrives. Pause freezes the window. The status line counts frames, error
   frames, and unmapped IDs. CAN-FD bitrate settings sit on their own row
 
-The DBC Compare, Log Replay, and Live Signal Viewer tabs all default to
-sharing whatever `.dbc` is currently loaded in the DBC Viewer tab, but can
-each load an independent one instead.
+The DBC Compare, Log Replay, and Live Signal Viewer tabs all start from
+whatever `.dbc` is currently loaded in the DBC Viewer tab. Log Replay and
+Live Signal Viewer can each add more DBC files, up to five.
 
 ## Requirements
 

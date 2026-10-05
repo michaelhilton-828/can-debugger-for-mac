@@ -1,25 +1,30 @@
 """The Live Signal Viewer tab: connect to a PEAK PCAN adapter over USB and
 plot live CAN/CAN-FD signals against a loaded .dbc in real time.
 
-Connection config and DBC-sharing follow the same conventions as
-log_replay.py's LogReplayTab. The two things genuinely new here: a
-background QThread (LiveCaptureWorker) receives frames off the GUI thread,
-and the plot is redrawn on a fixed-rate QTimer rather than per selection
-change, since data arrives continuously rather than being decoded once.
+Every received arbitration ID is listed in the frames table, with or
+without a DBC. Decoded signals still need a DBC that defines the ID.
+
+Decode uses the Home tab's DBC list, in that order. A connection keeps the
+databases it started with until disconnect. The two things genuinely new
+here: a background QThread (LiveCaptureWorker) receives frames off the GUI
+thread, and the plot is redrawn on a fixed-rate QTimer rather than per
+selection change, since data arrives continuously rather than being decoded
+once.
 """
 
 from __future__ import annotations
 
-import os
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
+from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -28,8 +33,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -40,48 +43,77 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .dbc_model import DbcLoadError, format_id_hex, load_database
-from .live_capture_model import BusConfig, DecodeDatabase, LiveSignalBuffer, build_bus_kwargs
+from .blf_log import BlfLogSession
+from .dbc_library import DbcLibrary
+from .dbc_model import format_id_hex
+from .live_capture_model import (
+    BusConfig,
+    DecodeDatabase,
+    LiveSignalBuffer,
+    build_bus_kwargs,
+    frame_type_label,
+)
+from .table_columns import install_column_config
+from .ui_state import remember_splitter
 from .live_capture_worker import LiveCaptureWorker
 from .log_replay_model import enum_ticks
 
 SIGNAL_HEADERS = ["DBC", "Message", "Signal", "Unit", "ID (hex)", "Samples"]
 SAMPLES_COL = SIGNAL_HEADERS.index("Samples")
+FRAME_HEADERS = ["ID (hex)", "Message", "Type", "Len", "Count", "Hz", "Data"]
+FRAME_ID_COL = 0
+FRAME_MESSAGE_COL = 1
+FRAME_TYPE_COL = 2
+FRAME_LEN_COL = 3
+FRAME_COUNT_COL = 4
+FRAME_HZ_COL = 5
+FRAME_DATA_COL = 6
 CLASSIC_BITRATES = [125_000, 250_000, 500_000, 1_000_000]
 REDRAW_INTERVAL_MS = 100  # 10 Hz
-MAX_DBCS = 5
 
 
-def _same_path(left: str, right: str) -> bool:
-    if not left or not right:
-        return False
-    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+class _SortItem(QTableWidgetItem):
+    """Sorts by the value stored in UserRole when both sides have one."""
+
+    def __lt__(self, other):
+        left = self.data(Qt.UserRole)
+        right = other.data(Qt.UserRole) if isinstance(other, QTableWidgetItem) else None
+        if left is not None and right is not None and type(left) is type(right):
+            return left < right
+        return super().__lt__(other)
 
 
 @dataclass
-class _LoadedDbc:
-    database: object
-    path: str
-    follows_viewer: bool = False
+class _LiveFrame:
+    """One row in the live frames table, accumulated across receive batches."""
 
-    @property
-    def label(self) -> str:
-        return Path(self.path).name
+    arbitration_id: int
+    is_extended: bool
+    is_fd: bool
+    bitrate_switch: bool
+    dlc: int
+    data: bytes
+    count: int
+    first_time: float
+    last_time: float
+    is_error: bool
+    is_remote: bool
+    message_name: str
 
-    @property
-    def display(self) -> str:
-        if self.follows_viewer:
-            return f"{self.label}  (from DBC Viewer)"
-        return self.label
+    def hz(self) -> float | None:
+        span = self.last_time - self.first_time
+        if self.count < 2 or span <= 0:
+            return None
+        return (self.count - 1) / span
 
 
 class LiveSignalViewerTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, library: DbcLibrary, parent=None):
         super().__init__(parent)
-        self._dbcs: list[_LoadedDbc] = []
-        self._browser_database = None
-        self._browser_database_path = ""
-        self._follow_viewer = True
+        self.library = library
+        self._catalog_key: tuple[str, ...] | None = None
+        self._capture_entries = None
+        self._capture_key: tuple[str, ...] = ()
 
         self._buffers: dict[tuple[str, str], LiveSignalBuffer] = {}
         self._row_keys: list[tuple[str, str]] = []
@@ -93,9 +125,15 @@ class LiveSignalViewerTab(QWidget):
         self._error_count = 0
         self._unmapped_count = 0
         self._session_active = False
+        self._frames: dict[int, _LiveFrame] = {}
+        self._logging = False
+        self._log_path = ""
+        self._log_session: BlfLogSession | None = None
 
         self._build_ui()
-        self._refresh_dbc_list()
+        self._install_space_filter()
+        self.library.changed.connect(self._on_library_changed)
+        self._on_library_changed()
         self._on_mode_changed(self.mode_combo.currentIndex())
 
         self._redraw_timer = QTimer(self)
@@ -107,31 +145,9 @@ class LiveSignalViewerTab(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        dbc_row = QHBoxLayout()
-        self.dbc_count_label = QLabel(f"DBC files (0/{MAX_DBCS})")
-        self.add_dbc_button = QPushButton("Add another DBC…")
-        self.add_dbc_button.setToolTip(f"Add a DBC file. At most {MAX_DBCS} can be loaded.")
-        self.add_dbc_button.clicked.connect(self._add_dbc_dialog)
-        self.remove_dbc_button = QPushButton("Remove")
-        self.remove_dbc_button.clicked.connect(self._remove_selected_dbc)
-        self.dbc_use_browser_button = QPushButton("Use DBC Viewer tab's DBC")
-        self.dbc_use_browser_button.clicked.connect(self._use_browser_dbc)
-        self.dbc_use_browser_button.setEnabled(False)
-        dbc_row.addWidget(self.dbc_count_label)
-        dbc_row.addStretch(1)
-        dbc_row.addWidget(self.add_dbc_button)
-        dbc_row.addWidget(self.remove_dbc_button)
-        dbc_row.addWidget(self.dbc_use_browser_button)
-        root.addLayout(dbc_row)
-
-        self.dbc_list = QListWidget()
-        self.dbc_list.setMaximumHeight(96)
-        self.dbc_list.setToolTip(
-            "Loaded DBC files, up to 5. If two files define the same CAN ID, "
-            "the one higher in this list is used to decode it."
-        )
-        self.dbc_list.currentRowChanged.connect(self._on_dbc_row_changed)
-        root.addWidget(self.dbc_list)
+        self.dbc_label = QLabel("No DBCs loaded on Home")
+        self.dbc_label.setStyleSheet("color: #555;")
+        root.addWidget(self.dbc_label)
 
         conn_row = QHBoxLayout()
         conn_row.addWidget(QLabel("Channel:"))
@@ -142,6 +158,11 @@ class LiveSignalViewerTab(QWidget):
         conn_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Classic CAN", "CAN FD"])
+        self.mode_combo.setCurrentIndex(1)
+        self.mode_combo.setToolTip(
+            "CAN FD uses the nominal and data bitrates on the next row. "
+            "500 kbit/s nominal and 2 Mbit/s data is the default."
+        )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         conn_row.addWidget(self.mode_combo)
 
@@ -152,12 +173,18 @@ class LiveSignalViewerTab(QWidget):
         conn_row.addWidget(self.classic_bitrate_combo)
 
         self.connect_button = QPushButton("Connect")
+        self.connect_button.setToolTip("Start the live connection. Space does this when a text field is not focused.")
         self.connect_button.clicked.connect(self._on_connect_clicked)
         self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.setToolTip("Stop the live connection. Space does this when a text field is not focused.")
         self.disconnect_button.clicked.connect(self._on_disconnect_clicked)
         self.disconnect_button.setEnabled(False)
         conn_row.addWidget(self.connect_button)
         conn_row.addWidget(self.disconnect_button)
+        self.log_button = QPushButton("Start log…")
+        self.log_button.setToolTip("Record every received frame to a Vector .blf file.")
+        self.log_button.clicked.connect(self._on_log_clicked)
+        conn_row.addWidget(self.log_button)
         conn_row.addStretch(1)
         root.addLayout(conn_row)
 
@@ -193,29 +220,67 @@ class LiveSignalViewerTab(QWidget):
         self.pause_button.setEnabled(False)
         self.pause_button.toggled.connect(self._on_pause_toggled)
         status_row.addWidget(self.pause_button)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setToolTip(
+            "Clear the frames table, signal history, and plot. The connection stays open."
+        )
+        self.clear_button.clicked.connect(self._on_clear_clicked)
+        status_row.addWidget(self.clear_button)
         root.addLayout(status_row)
 
         splitter = QSplitter(Qt.Horizontal)
         root.addWidget(splitter, 1)
 
-        # --- left: signal table -------------------------------------------
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        # --- left: received frames, then decoded signals -------------------
+        left = QSplitter(Qt.Vertical)
+        left.setChildrenCollapsible(False)
+
+        frames_panel = QWidget()
+        frames_layout = QVBoxLayout(frames_panel)
+        frames_layout.setContentsMargins(0, 0, 0, 0)
+        frames_layout.addWidget(QLabel("Frames"))
+        self.frame_filter = QLineEdit()
+        self.frame_filter.setPlaceholderText("Filter frames by ID, message, or data…")
+        self.frame_filter.textChanged.connect(self._filter_frames)
+        frames_layout.addWidget(self.frame_filter)
+        self.frame_table = QTableWidget(0, len(FRAME_HEADERS))
+        self.frame_table.setHorizontalHeaderLabels(FRAME_HEADERS)
+        self.frame_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.frame_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.frame_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.frame_table.setTextElideMode(Qt.ElideRight)
+        frame_header = self.frame_table.horizontalHeader()
+        frame_header.setStretchLastSection(True)
+        self.frame_table.setSortingEnabled(True)
+        install_column_config(self.frame_table, "live.frames")
+        frame_header.setSectionResizeMode(QHeaderView.Interactive)
+        frame_header.setSectionResizeMode(FRAME_DATA_COL, QHeaderView.Stretch)
+        frames_layout.addWidget(self.frame_table, 1)
+        left.addWidget(frames_panel)
+
+        signals_panel = QWidget()
+        signals_layout = QVBoxLayout(signals_panel)
+        signals_layout.setContentsMargins(0, 0, 0, 0)
         self.signal_filter = QLineEdit()
         self.signal_filter.setPlaceholderText("Filter signals by name…")
         self.signal_filter.textChanged.connect(self._filter_signals)
-        left_layout.addWidget(self.signal_filter)
+        signals_layout.addWidget(self.signal_filter)
 
         self.signal_table = QTableWidget(0, len(SIGNAL_HEADERS))
         self.signal_table.setHorizontalHeaderLabels(SIGNAL_HEADERS)
         self.signal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.signal_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.signal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.signal_table.horizontalHeader().setStretchLastSection(True)
         self.signal_table.setSortingEnabled(True)
-        left_layout.addWidget(self.signal_table, 1)
+        install_column_config(self.signal_table, "live.signals")
+        signal_header = self.signal_table.horizontalHeader()
+        signal_header.setSectionResizeMode(QHeaderView.Interactive)
+        signal_header.setSectionResizeMode(SAMPLES_COL, QHeaderView.Stretch)
+        signals_layout.addWidget(self.signal_table, 1)
+        left.addWidget(signals_panel)
+        left.setStretchFactor(0, 1)
+        left.setStretchFactor(1, 2)
         splitter.addWidget(left)
 
         # --- right: plot options + embedded canvas -------------------------
@@ -235,6 +300,8 @@ class LiveSignalViewerTab(QWidget):
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
+        remember_splitter(left, "live.frames-signals")
+        remember_splitter(splitter, "live.table-plot")
 
     @staticmethod
     def _make_bitrate_spin(default: int) -> QSpinBox:
@@ -259,141 +326,42 @@ class LiveSignalViewerTab(QWidget):
 
     # -------------------------------------------------------------- DBC sync
 
-    def set_browser_database(self, database, path: str) -> None:
-        """Slot for BrowserTab.database_loaded.
+    def _library_key(self) -> tuple[str, ...]:
+        return tuple(entry.path for entry in self.library.entries())
 
-        The viewer file occupies one slot and stays current until the user
-        removes it. A connection already in progress keeps the databases it
-        started with; the list updates for the next Connect.
-        """
-        self._browser_database = database
-        self._browser_database_path = path
-        if self._follow_viewer and self._worker is None:
-            self._upsert_viewer_slot()
+    def _active_entries(self):
+        """Databases for decode: the ones Connect started with, while it runs."""
+        if self._worker is not None and self._capture_entries is not None:
+            return self._capture_entries
+        return self.library.entries()
+
+    def _on_library_changed(self):
+        key = self._library_key()
+        self._update_dbc_label()
+        if self._worker is not None:
+            return
+        if key == self._catalog_key:
+            return
+        self._catalog_key = key
+        self._rebuild_signal_catalog()
+
+    def _update_dbc_label(self):
+        entries = self.library.entries()
+        if entries:
+            text = "DBCs from Home: " + ", ".join(entry.label for entry in entries)
         else:
-            self._refresh_dbc_list()
+            text = "No DBCs loaded on Home"
+        if self._worker is not None and self._library_key() != self._capture_key:
+            text += " — still using the DBCs from connect"
+        self.dbc_label.setText(text)
+        self.dbc_label.setToolTip(text)
 
-    def _viewer_slot(self) -> _LoadedDbc | None:
-        for slot in self._dbcs:
-            if slot.follows_viewer or _same_path(slot.path, self._browser_database_path):
-                return slot
-        return None
-
-    def _upsert_viewer_slot(self):
-        if self._browser_database is None:
-            self._refresh_dbc_list()
-            return
-        existing = self._viewer_slot()
-        if existing is not None:
-            existing.database = self._browser_database
-            existing.path = self._browser_database_path
-            existing.follows_viewer = True
-            self._refresh_after_dbc_change()
-            return
-        if len(self._dbcs) >= MAX_DBCS:
-            self._refresh_dbc_list()
-            return
-        self._dbcs.insert(
-            0,
-            _LoadedDbc(self._browser_database, self._browser_database_path, follows_viewer=True),
-        )
-        self._refresh_after_dbc_change()
-
-    def _add_dbc_dialog(self):
-        if len(self._dbcs) >= MAX_DBCS:
-            QMessageBox.information(
-                self,
-                "DBC limit reached",
-                f"A maximum of {MAX_DBCS} DBC files can be loaded. Remove one to add another.",
-            )
-            return
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add DBC files", "", "CAN database (*.dbc);;All files (*)"
-        )
-        if not paths:
-            return
-        added = 0
-        duplicates = 0
-        stopped_early = False
-        for path in paths:
-            if len(self._dbcs) >= MAX_DBCS:
-                stopped_early = True
-                break
-            if any(_same_path(slot.path, path) for slot in self._dbcs):
-                duplicates += 1
-                continue
-            try:
-                database = load_database(path)
-            except DbcLoadError as exc:
-                QMessageBox.critical(self, "Failed to load .dbc file", str(exc))
-                continue
-            self._dbcs.append(_LoadedDbc(database, path, follows_viewer=False))
-            added += 1
-        if stopped_early:
-            QMessageBox.information(
-                self,
-                "DBC limit reached",
-                f"Stopped at {MAX_DBCS} DBC files. Extra selections were not loaded.",
-            )
-        elif added == 0 and duplicates:
-            QMessageBox.information(self, "Already loaded", "Those DBC files are already in the list.")
-        if added:
-            self._refresh_after_dbc_change()
-        else:
-            self._refresh_dbc_list()
-
-    def _remove_selected_dbc(self):
-        row = self.dbc_list.currentRow()
-        if row < 0 or row >= len(self._dbcs):
-            return
-        removed = self._dbcs.pop(row)
-        if removed.follows_viewer:
-            self._follow_viewer = False
-        self._refresh_after_dbc_change()
-
-    def _use_browser_dbc(self):
-        if self._browser_database is None:
-            return
-        if self._viewer_slot() is None and len(self._dbcs) >= MAX_DBCS:
-            QMessageBox.information(
-                self,
-                "DBC limit reached",
-                f"Remove a DBC file first. The maximum is {MAX_DBCS}.",
-            )
-            return
-        self._follow_viewer = True
-        self._upsert_viewer_slot()
-
-    def _on_dbc_row_changed(self, _row: int):
-        self.remove_dbc_button.setEnabled(self._worker is None and self.dbc_list.currentRow() >= 0)
-
-    def _refresh_dbc_list(self):
-        selected = self.dbc_list.currentRow()
-        self.dbc_list.blockSignals(True)
-        self.dbc_list.clear()
-        for slot in self._dbcs:
-            item = QListWidgetItem(slot.display)
-            item.setToolTip(slot.path)
-            self.dbc_list.addItem(item)
-        if 0 <= selected < self.dbc_list.count():
-            self.dbc_list.setCurrentRow(selected)
-        self.dbc_list.blockSignals(False)
-        self.dbc_count_label.setText(f"DBC files ({len(self._dbcs)}/{MAX_DBCS})")
-        editable = self._worker is None
-        self.add_dbc_button.setEnabled(editable and len(self._dbcs) < MAX_DBCS)
-        self.remove_dbc_button.setEnabled(editable and self.dbc_list.currentRow() >= 0)
-        viewer_missing = self._browser_database is not None and self._viewer_slot() is None
-        self.dbc_use_browser_button.setEnabled(editable and viewer_missing)
-
-    def _refresh_after_dbc_change(self):
-        self._refresh_dbc_list()
-        if self._worker is None:
-            self._rebuild_signal_catalog()
-
-    def _decode_databases(self) -> list[DecodeDatabase]:
+    def _decode_databases(self, entries=None) -> list[DecodeDatabase]:
+        if entries is None:
+            entries = self._active_entries()
         return [
-            DecodeDatabase(source_id=slot.path, label=slot.label, database=slot.database)
-            for slot in self._dbcs
+            DecodeDatabase(source_id=entry.path, label=entry.label, database=entry.database)
+            for entry in entries
         ]
 
     # ------------------------------------------------------------ connection
@@ -409,15 +377,103 @@ class LiveSignalViewerTab(QWidget):
             fd_data_sample_point=self.fd_data_sp_spin.value(),
         )
 
-    def _on_connect_clicked(self):
-        if not self._dbcs:
-            QMessageBox.warning(self, "No DBC loaded", "Add a .dbc file before connecting.")
-            return
+    def _connection_label(self) -> str:
+        channel = self.channel_edit.text().strip() or "PCAN_USBBUS1"
+        if self.mode_combo.currentIndex() == 1:
+            nom = self.fd_nom_bitrate_spin.value() / 1000
+            data = self.fd_data_bitrate_spin.value() / 1000
+            return f"{channel}, CAN FD {nom:.0f}/{data:.0f} kbit/s"
+        rate = self.classic_bitrate_combo.currentData() / 1000
+        return f"{channel}, classic {rate:.0f} kbit/s"
 
+    def _install_space_filter(self):
+        for widget in self.findChildren(QWidget):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """Space starts and stops the connection, except while typing."""
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Space
+            and not event.isAutoRepeat()
+            and self.isVisible()
+            and not isinstance(obj, (QLineEdit, QAbstractSpinBox, QComboBox))
+        ):
+            self._toggle_connection()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _toggle_connection(self):
+        if self._worker is None:
+            self._on_connect_clicked()
+        else:
+            self._on_disconnect_clicked()
+
+    def _on_log_clicked(self):
+        if self._logging:
+            self._stop_log()
+            self._update_status(
+                f"Connected: {self._connection_label()}" if self._session_active else "Disconnected"
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Record BLF log", "", "Vector BLF (*.blf)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".blf"):
+            path += ".blf"
+        self._log_path = path
+        self._logging = True
+        self.log_button.setText("Stop log")
+        if self._worker is None:
+            self._on_connect_clicked()
+        else:
+            self._attach_log()
+
+    def _attach_log(self):
+        """Open the chosen .blf and hand it to the running worker."""
+        if not self._logging or not self._log_path or self._worker is None or self._log_session is not None:
+            return
+        try:
+            session = BlfLogSession(self._log_path)
+        except OSError as exc:
+            self._logging = False
+            self._log_path = ""
+            self.log_button.setText("Start log…")
+            QMessageBox.critical(self, "Could not start log", str(exc))
+            return
+        self._log_session = session
+        self._worker.set_log_session(session)
+
+    def _stop_log(self):
+        self._logging = False
+        self._log_path = ""
+        session = self._log_session
+        self._log_session = None
+        if self._worker is not None:
+            previous = self._worker.set_log_session(None)
+            if previous is not None and previous is not session:
+                previous.close()
+        if session is not None:
+            session.close()
+        if hasattr(self, "log_button"):
+            self.log_button.setText("Start log…")
+
+    def _on_log_error(self, message: str):
+        """The worker already closed the session and kept the bus open."""
+        self._log_session = None
+        self._logging = False
+        self._log_path = ""
+        self.log_button.setText("Start log…")
+        QMessageBox.warning(self, "Log stopped", message)
+
+    def _on_connect_clicked(self):
         config = self._read_bus_config()
         bus_kwargs = {"interface": "pcan", **build_bus_kwargs(config)}
 
         self._clear_samples()
+        self._clear_frames()
         self._frame_count = 0
         self._error_count = 0
         self._unmapped_count = 0
@@ -425,11 +481,16 @@ class LiveSignalViewerTab(QWidget):
         self.figure.clear()
         self.canvas.draw_idle()
 
-        self._worker = LiveCaptureWorker(bus_kwargs, self._decode_databases())
+        entries = list(self.library.entries())
+        self._capture_entries = entries
+        self._capture_key = tuple(entry.path for entry in entries)
+        self._worker = LiveCaptureWorker(bus_kwargs, self._decode_databases(entries))
         self._worker.connected.connect(self._on_connected)
         self._worker.samples_ready.connect(self._on_samples_ready)
+        self._worker.frames_ready.connect(self._on_frames_ready)
         self._worker.traffic_counts.connect(self._on_traffic_counts)
         self._worker.error.connect(self._on_worker_error)
+        self._worker.log_error.connect(self._on_log_error)
         self._set_ui_connecting()
         self._worker.start()
 
@@ -437,14 +498,15 @@ class LiveSignalViewerTab(QWidget):
         self._connect_t0 = time.monotonic()
         self.disconnect_button.setEnabled(True)
         self.pause_button.setEnabled(True)
-        self._update_status(f"Connected: {self.channel_edit.text()}")
+        self._attach_log()
+        self._update_status(f"Connected: {self._connection_label()}")
         self._redraw_timer.start()
 
     def _on_traffic_counts(self, frames: int, errors: int, unmapped: int):
         self._frame_count += frames
         self._error_count += errors
         self._unmapped_count += unmapped
-        prefix = "Paused" if self._paused else f"Connected: {self.channel_edit.text()}"
+        prefix = "Paused" if self._paused else f"Connected: {self._connection_label()}"
         self._update_status(prefix)
 
     def _on_pause_toggled(self, checked: bool):
@@ -452,16 +514,39 @@ class LiveSignalViewerTab(QWidget):
         self.pause_button.setText("Resume" if checked else "Pause")
         if checked:
             self._paused_now = time.monotonic() - self._connect_t0
-        prefix = "Paused" if checked else f"Connected: {self.channel_edit.text()}"
+        prefix = "Paused" if checked else f"Connected: {self._connection_label()}"
         self._update_status(prefix)
+
+    def _on_clear_clicked(self):
+        """Drop captured frames and signal history. Stay connected, and leave Pause as it is."""
+        self._clear_samples()
+        self._clear_frames()
+        self._frame_count = 0
+        self._error_count = 0
+        self._unmapped_count = 0
+        if self._session_active:
+            self._update_status(self._status_prefix())
+        self._redraw()
+
+    def _status_prefix(self) -> str:
+        if self._worker is not None:
+            return "Paused" if self._paused else f"Connected: {self._connection_label()}"
+        text = self.status_label.text()
+        if " — " in text:
+            return text.split(" — ", 1)[0]
+        return text or "Disconnected"
 
     def _update_status(self, prefix: str):
         if not self._session_active:
             self.status_label.setText(prefix)
             return
+        log_note = ""
+        if self._log_session is not None:
+            log_note = f", logging {self._log_session.count} to {Path(self._log_path).name}"
         self.status_label.setText(
             f"{prefix} — {self._frame_count} frames, "
             f"{self._error_count} errors, {self._unmapped_count} unmapped"
+            f"{log_note}"
         )
 
     def _on_disconnect_clicked(self):
@@ -474,14 +559,18 @@ class LiveSignalViewerTab(QWidget):
         QMessageBox.critical(self, "Connection error", message)
 
     def _stop_worker(self):
+        self._stop_log()
         self._redraw_timer.stop()
-        if self._worker is not None:
-            self._worker.requestInterruption()
-            self._worker.wait()
-            self._worker.deleteLater()
-            self._worker = None
+        worker = self._worker
+        self._worker = None
+        self._capture_entries = None
+        if worker is not None:
+            worker.requestInterruption()
+            worker.wait()
+            worker.deleteLater()
         self._set_ui_disconnected()
         self._clear_pause()
+        self._on_library_changed()
 
     def shutdown(self):
         """Called from MainWindow.closeEvent so a connected session is torn
@@ -494,10 +583,6 @@ class LiveSignalViewerTab(QWidget):
         self.mode_combo.setEnabled(False)
         self.classic_bitrate_combo.setEnabled(False)
         self.fd_row.setEnabled(False)
-        self.add_dbc_button.setEnabled(False)
-        self.remove_dbc_button.setEnabled(False)
-        self.dbc_use_browser_button.setEnabled(False)
-        self.dbc_list.setEnabled(False)
         self.status_label.setText("Connecting…")
 
     def _set_ui_disconnected(self):
@@ -508,8 +593,6 @@ class LiveSignalViewerTab(QWidget):
         self.mode_combo.setEnabled(True)
         self.classic_bitrate_combo.setEnabled(True)
         self.fd_row.setEnabled(True)
-        self.dbc_list.setEnabled(True)
-        self._refresh_dbc_list()
 
     def _clear_pause(self):
         self._paused = False
@@ -527,14 +610,15 @@ class LiveSignalViewerTab(QWidget):
         self._row_keys = []
         self.signal_table.setSortingEnabled(False)
         self.signal_table.setRowCount(0)
-        if not self._dbcs:
+        entries = self.library.entries()
+        if not entries:
             self.signal_table.setSortingEnabled(True)
             return
         keys = []
-        for slot in self._dbcs:
-            for msg in slot.database.messages:
+        for entry in entries:
+            for msg in entry.database.messages:
                 for sig in msg.signals:
-                    key = (slot.path, msg.name, sig.name)
+                    key = (entry.path, msg.name, sig.name)
                     if key in self._buffers:
                         continue
                     self._buffers[key] = LiveSignalBuffer(
@@ -542,8 +626,8 @@ class LiveSignalViewerTab(QWidget):
                         signal_name=sig.name,
                         arbitration_id=msg.frame_id,
                         unit=sig.unit or "",
-                        source_id=slot.path,
-                        dbc_label=slot.label,
+                        source_id=entry.path,
+                        dbc_label=entry.label,
                         choices=sig.choices or {},
                     )
                     keys.append(key)
@@ -574,6 +658,123 @@ class LiveSignalViewerTab(QWidget):
             buf.values.clear()
         if self.signal_table.rowCount():
             self._update_sample_counts()
+
+    def _clear_frames(self):
+        self._frames.clear()
+        self.frame_table.setRowCount(0)
+
+    def _message_name_for(self, arbitration_id: int) -> str:
+        for entry in self._active_entries():
+            try:
+                return entry.database.get_message_by_frame_id(arbitration_id).name
+            except (KeyError, AttributeError):
+                continue
+        return ""
+
+    def _on_frames_ready(self, snaps: list) -> None:
+        """Accumulate one batch of per-ID snapshots. The table is painted
+        from _redraw so a busy bus does not rebuild rows on every flush."""
+        now = time.monotonic() - self._connect_t0
+        new_ids = []
+        for snap in snaps:
+            frame = self._frames.get(snap.arbitration_id)
+            if frame is None:
+                frame = _LiveFrame(
+                    arbitration_id=snap.arbitration_id,
+                    is_extended=snap.is_extended,
+                    is_fd=snap.is_fd,
+                    bitrate_switch=snap.bitrate_switch,
+                    dlc=snap.dlc,
+                    data=snap.data,
+                    count=0,
+                    first_time=now,
+                    last_time=now,
+                    is_error=snap.is_error,
+                    is_remote=snap.is_remote,
+                    message_name=self._message_name_for(snap.arbitration_id),
+                )
+                self._frames[snap.arbitration_id] = frame
+                new_ids.append(snap.arbitration_id)
+            frame.count += snap.count
+            frame.last_time = now
+            frame.data = snap.data
+            frame.dlc = snap.dlc
+            frame.is_extended = snap.is_extended
+            frame.is_fd = snap.is_fd
+            frame.bitrate_switch = snap.bitrate_switch
+            frame.is_error = snap.is_error
+            frame.is_remote = snap.is_remote
+        if new_ids:
+            self._append_frame_rows(new_ids)
+
+    def _append_frame_rows(self, arbitration_ids: list[int]) -> None:
+        self.frame_table.setSortingEnabled(False)
+        start_row = self.frame_table.rowCount()
+        self.frame_table.setRowCount(start_row + len(arbitration_ids))
+        for i, arbitration_id in enumerate(arbitration_ids):
+            frame = self._frames[arbitration_id]
+            for col, text, sort_key in self._frame_cells(frame):
+                item = _SortItem(text)
+                item.setData(Qt.UserRole, sort_key)
+                item.setData(Qt.UserRole + 1, arbitration_id)
+                if col == FRAME_DATA_COL:
+                    item.setToolTip(text)
+                self.frame_table.setItem(start_row + i, col, item)
+        self.frame_table.setSortingEnabled(True)
+        self._filter_frames(self.frame_filter.text())
+
+    def _frame_cells(self, frame: _LiveFrame) -> list[tuple[int, str, object]]:
+        rate = frame.hz()
+        data = frame.data.hex(" ")
+        return [
+            (FRAME_ID_COL, format_id_hex(frame.arbitration_id, frame.is_extended), frame.arbitration_id),
+            (FRAME_MESSAGE_COL, frame.message_name, frame.message_name.lower()),
+            (FRAME_TYPE_COL, frame_type_label(frame), frame_type_label(frame)),
+            (FRAME_LEN_COL, str(frame.dlc), frame.dlc),
+            (FRAME_COUNT_COL, str(frame.count), frame.count),
+            (FRAME_HZ_COL, "" if rate is None else f"{rate:.1f}", -1.0 if rate is None else rate),
+            (FRAME_DATA_COL, data, data),
+        ]
+
+    def _refresh_frame_table(self):
+        # Sorting stays off while cells change, otherwise a live Count column
+        # reorders rows in the middle of this loop.
+        self.frame_table.setSortingEnabled(False)
+        try:
+            for row in range(self.frame_table.rowCount()):
+                id_item = self.frame_table.item(row, FRAME_ID_COL)
+                if id_item is None:
+                    continue
+                frame = self._frames.get(id_item.data(Qt.UserRole + 1))
+                if frame is None:
+                    continue
+                for col, text, sort_key in self._frame_cells(frame):
+                    item = self.frame_table.item(row, col)
+                    if item is None:
+                        continue
+                    if item.text() != text:
+                        item.setText(text)
+                    if item.data(Qt.UserRole) != sort_key:
+                        item.setData(Qt.UserRole, sort_key)
+                    if col == FRAME_DATA_COL and item.toolTip() != text:
+                        item.setToolTip(text)
+        finally:
+            self.frame_table.setSortingEnabled(True)
+
+    def _filter_frames(self, text: str):
+        text = text.strip().lower()
+        for row in range(self.frame_table.rowCount()):
+            id_item = self.frame_table.item(row, FRAME_ID_COL)
+            if id_item is None:
+                continue
+            frame = self._frames.get(id_item.data(Qt.UserRole + 1))
+            if frame is None:
+                continue
+            haystack = (
+                f"{format_id_hex(frame.arbitration_id, frame.is_extended)} "
+                f"{frame.arbitration_id:x} {frame.message_name} {frame.data.hex()}"
+            ).lower()
+            self.frame_table.setRowHidden(row, bool(text) and text not in haystack)
 
     def _on_samples_ready(self, samples: list) -> None:
         """Slot for worker.samples_ready. Only mutates buffers/table - never
@@ -666,38 +867,50 @@ class LiveSignalViewerTab(QWidget):
             for buf in self._buffers.values():
                 buf.trim(now, window_s)
         self._update_sample_counts()
+        self._refresh_frame_table()
+
+        try:
+            self._render_plot(now, window_s)
+        except Exception:
+            # figure.clear() runs before the axes are drawn. A failure after
+            # that used to return without draw_idle and leave a white canvas.
+            traceback.print_exc()
+            self.figure.clear()
+            self._draw_placeholder("Could not draw plot", now, window_s)
+
+    def _render_plot(self, now: float, window_s: float) -> None:
+        selected = list(self._selected_series())
+        plottable = []
+        for buf in selected:
+            xs, ys = _numeric_points(buf)
+            if xs:
+                plottable.append((buf, xs, ys))
 
         self.figure.clear()
-        selected = [buf for buf in self._selected_series() if buf.times]
-        if not selected:
-            self.canvas.draw_idle()
+        if not plottable:
+            note = "No samples yet" if selected else "Select a signal"
+            self._draw_placeholder(note, now, window_s)
             return
 
-        overlay = self.overlay_checkbox.isChecked() or len(selected) == 1
+        overlay = self.overlay_checkbox.isChecked() or len(plottable) == 1
 
         if overlay:
             ax = self.figure.add_subplot(111)
-            for buf in selected:
-                ax.plot(list(buf.times), list(buf.values), label=buf.display_label)
-                positions, labels = enum_ticks(buf.choices)
-                if positions:
-                    ax.set_yticks(positions)
-                    ax.set_yticklabels(labels)
+            for buf, xs, ys in plottable:
+                ax.plot(xs, ys, label=buf.display_label)
+                _apply_enum_ticks(ax, buf.choices)
             ax.set_xlabel("Time (s, since connect)")
             ax.legend()
             ax.grid(True)
             primary = ax
         else:
-            axes = self.figure.subplots(len(selected), 1, sharex=True)
-            if len(selected) == 1:
+            axes = self.figure.subplots(len(plottable), 1, sharex=True)
+            if len(plottable) == 1:
                 axes = [axes]
-            for ax, buf in zip(axes, selected):
-                ax.plot(list(buf.times), list(buf.values))
+            for ax, (buf, xs, ys) in zip(axes, plottable):
+                ax.plot(xs, ys)
                 ax.set_ylabel(buf.display_label)
-                positions, labels = enum_ticks(buf.choices)
-                if positions:
-                    ax.set_yticks(positions)
-                    ax.set_yticklabels(labels)
+                _apply_enum_ticks(ax, buf.choices)
                 ax.grid(True)
             axes[-1].set_xlabel("Time (s, since connect)")
             primary = axes[-1]
@@ -706,3 +919,46 @@ class LiveSignalViewerTab(QWidget):
         if self._paused:
             primary.set_xlim(self._paused_now - window_s, self._paused_now)
         self.canvas.draw_idle()
+
+    def _draw_placeholder(self, note: str, now: float, window_s: float) -> None:
+        ax = self.figure.add_subplot(111)
+        ax.set_xlabel("Time (s, since connect)")
+        ax.grid(True)
+        if self._connect_t0 or self._paused:
+            ax.set_xlim(now - window_s, now)
+        ax.text(
+            0.5,
+            0.5,
+            note,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="#666",
+            fontsize=12,
+        )
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+
+def _numeric_points(buf) -> tuple[list, list]:
+    """Times and numeric values. Non-numeric samples are skipped so one bad value cannot blank the canvas."""
+    xs = []
+    ys = []
+    for t, value in zip(buf.times, buf.values):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            value = value.value if hasattr(value, "value") else value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        xs.append(t)
+        ys.append(value)
+    return xs, ys
+
+
+def _apply_enum_ticks(ax, choices) -> None:
+    positions, labels = enum_ticks(choices)
+    if not positions:
+        return
+    if any(isinstance(pos, bool) or not isinstance(pos, (int, float)) for pos in positions):
+        return
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels)

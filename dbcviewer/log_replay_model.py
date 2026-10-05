@@ -26,13 +26,14 @@ class SignalSeries:
     signal_name: str
     arbitration_id: int
     unit: str
+    dbc_label: str = ""
     choices: dict = field(default_factory=dict)
     times: list = field(default_factory=list)
     values: list = field(default_factory=list)
 
     @property
-    def key(self) -> tuple[str, str]:
-        return (self.message_name, self.signal_name)
+    def key(self) -> tuple[str, str, str]:
+        return (self.dbc_label, self.message_name, self.signal_name)
 
     @property
     def display_label(self) -> str:
@@ -41,8 +42,30 @@ class SignalSeries:
         return f"{self.signal_name} [{self.unit}]" if self.unit else self.signal_name
 
 
-def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], set[int]]:
-    """Decode every frame in a CAN log file against `database`.
+def _database_sources(databases) -> list[tuple[str, object]]:
+    """Normalize one database, or a sequence of (label, database), into a list.
+
+    Earlier entries win when several databases define the same CAN ID.
+    """
+    if databases is None:
+        return []
+    if hasattr(databases, "get_message_by_frame_id"):
+        return [("", databases)]
+    sources = []
+    for item in databases:
+        if hasattr(item, "get_message_by_frame_id"):
+            sources.append(("", item))
+        else:
+            label, database = item
+            sources.append((str(label), database))
+    return sources
+
+
+def load_log(path: str, databases) -> tuple[dict[tuple[str, str, str], SignalSeries], set[int]]:
+    """Decode every frame in a CAN log file against one or more databases.
+
+    `databases` is a cantools database or a sequence of ``(label, database)``.
+    The first database that defines a CAN ID is the one used for that ID.
 
     Uses can.LogReader, which dispatches to the right reader by file
     extension (see supported_log_extensions()) - so any format python-can
@@ -56,25 +79,33 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
     file-open/parse failures raise.
 
     Returns (signals, unmapped_ids), where unmapped_ids is the set of
-    arbitration IDs seen in the log with no matching message in `database`.
+    arbitration IDs seen in the log with no matching message.
     """
     try:
         reader = can.LogReader(path)
     except (ValueError, OSError) as exc:
         raise LogLoadError(f"Could not read log file:\n{exc}") from exc
 
-    signals: dict[tuple[str, str], SignalSeries] = {}
+    signals: dict[tuple[str, str, str], SignalSeries] = {}
     unmapped_ids: set[int] = set()
+    sources = _database_sources(databases)
     try:
         with reader:
             for msg in reader:
                 if msg.is_error_frame or msg.is_remote_frame:
                     continue
-                try:
-                    dbc_msg = database.get_message_by_frame_id(msg.arbitration_id)
-                except KeyError:
+                dbc_label = ""
+                dbc_msg = None
+                for label, database in sources:
+                    try:
+                        dbc_msg = database.get_message_by_frame_id(msg.arbitration_id)
+                    except KeyError:
+                        continue
+                    dbc_label = label
+                    break
+                if dbc_msg is None:
                     unmapped_ids.add(msg.arbitration_id)
-                    key = ("Unknown", f"id_{msg.arbitration_id}")
+                    key = ("", "Unknown", f"id_{msg.arbitration_id}")
                     entry = signals.get(key)
                     if entry is None:
                         entry = SignalSeries(
@@ -92,7 +123,7 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
                 except Exception:
                     continue
                 for sig_name, value in decoded.items():
-                    key = (dbc_msg.name, sig_name)
+                    key = (dbc_label, dbc_msg.name, sig_name)
                     entry = signals.get(key)
                     if entry is None:
                         sig_def = dbc_msg.get_signal_by_name(sig_name)
@@ -101,6 +132,7 @@ def load_log(path: str, database) -> tuple[dict[tuple[str, str], SignalSeries], 
                             signal_name=sig_name,
                             arbitration_id=msg.arbitration_id,
                             unit=sig_def.unit or "",
+                            dbc_label=dbc_label,
                             choices=sig_def.choices or {},
                         )
                         signals[key] = entry

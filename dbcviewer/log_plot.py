@@ -13,14 +13,13 @@ import csv
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QHBoxLayout,
+    QFrame,
     QLabel,
     QLayout,
     QPushButton,
@@ -48,10 +47,13 @@ DIFF_COLOR = "#C45C26"
 ZOOM_IN = 0.8
 ZOOM_OUT = 1.25
 _MAX_ENUM_TICKS = 24
+_CTRL_HEIGHT = 28
+_BTN_MIN_WIDTH = 64
 
 
 def _sid(series) -> str:
-    return f"{series.message_name}\0{series.signal_name}"
+    label = getattr(series, "dbc_label", "") or ""
+    return f"{label}\0{series.message_name}\0{series.signal_name}"
 
 
 class FlowLayout(QLayout):
@@ -112,7 +114,6 @@ class FlowLayout(QLayout):
             hint = item.sizeHint()
             minimum = item.minimumSize()
             width = max(minimum.width(), hint.width())
-            height = max(minimum.height(), hint.height())
             widget = item.widget()
             flexible = False
             if widget is not None:
@@ -122,12 +123,16 @@ class FlowLayout(QLayout):
                     QSizePolicy.Expanding,
                     QSizePolicy.MinimumExpanding,
                 )
-            if x + width > right and line_height > 0:
+            # right() is inclusive, so an item that ends on that pixel still fits.
+            if x + width > right + 1 and line_height > 0:
                 x = rect.x() + margins.left()
                 y += line_height + self._spacing
                 line_height = 0
             if flexible:
                 width = max(minimum.width(), min(width, max(minimum.width(), right - x + 1)))
+            height = max(minimum.height(), hint.height())
+            if widget is not None and width > 0 and widget.hasHeightForWidth():
+                height = max(minimum.height(), widget.heightForWidth(width))
             if not test_only:
                 item.setGeometry(QRect(x, y, width, height))
             x += width + self._spacing
@@ -136,9 +141,9 @@ class FlowLayout(QLayout):
 
 
 class FlowHost(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, spacing: int = 6):
         super().__init__(parent)
-        self.flow = FlowLayout(self)
+        self.flow = FlowLayout(self, spacing=spacing)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def hasHeightForWidth(self):
@@ -149,6 +154,100 @@ class FlowHost(QWidget):
 
     def sizeHint(self):
         return QSize(480, self.flow.heightForWidth(480))
+
+
+class ToolGroup(QFrame):
+    """Compact framed toolbar section: a short title over a wrapping row of controls.
+
+    The group is one item in the outer flow, so a narrow window moves the whole
+    section to the next line. If the section itself is wider than the window,
+    its own flow wraps controls instead of cutting one in half.
+    """
+
+    _MARGIN = (8, 4, 8, 6)  # left, top, right, bottom
+    _GAP = 2
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.group_title = title
+        self.setObjectName(f"plotToolGroup{title}")
+        self.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred)
+        self.title_label = QLabel(title, self)
+        self.title_label.setObjectName("plotToolGroupTitle")
+        self.title_label.setStyleSheet(
+            "color: #666; font-size: 11px; font-weight: 600; background: transparent;"
+        )
+        self.body = QWidget(self)
+        self.body.setObjectName("plotToolGroupBody")
+        self.flow = FlowLayout(self.body, spacing=4)
+        self._recompute_minimum_width()
+
+    def addWidget(self, widget):
+        self.flow.addWidget(widget)
+        self._recompute_minimum_width()
+        return widget
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor("#dddddd")))
+        painter.setBrush(QColor("#fafafa"))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        left, top, right, bottom = self._MARGIN
+        inner = max(1, width - left - right)
+        return top + self._title_height() + self._GAP + self.flow.heightForWidth(inner) + bottom
+
+    def sizeHint(self):
+        width = self._preferred_width()
+        return QSize(width, self.heightForWidth(width))
+
+    def minimumSizeHint(self):
+        return QSize(self._minimum_width(), self.heightForWidth(max(self._preferred_width(), 1)))
+
+    def _title_height(self) -> int:
+        return max(self.title_label.sizeHint().height(), 14)
+
+    def _preferred_width(self) -> int:
+        left, _top, right, _bottom = self._MARGIN
+        spacing = self.flow._spacing
+        total = 0
+        count = self.flow.count()
+        for index in range(count):
+            item = self.flow.itemAt(index)
+            hint = item.sizeHint()
+            total += max(item.minimumSize().width(), hint.width())
+        if count > 1:
+            total += spacing * (count - 1)
+        total = max(total, self.title_label.sizeHint().width())
+        return total + left + right
+
+    def _minimum_width(self) -> int:
+        left, _top, right, _bottom = self._MARGIN
+        widest = self.title_label.sizeHint().width()
+        for index in range(self.flow.count()):
+            widest = max(widest, self.flow.itemAt(index).minimumSize().width())
+        return widest + left + right
+
+    def _recompute_minimum_width(self):
+        self.setMinimumWidth(self._minimum_width())
+
+    def _place(self):
+        left, top, right, bottom = self._MARGIN
+        inner_w = max(1, self.width() - left - right)
+        title_h = self._title_height()
+        self.title_label.setGeometry(left, top, inner_w, title_h)
+        body_y = top + title_h + self._GAP
+        body_h = max(1, self.height() - body_y - bottom)
+        self.body.setGeometry(left, body_y, inner_w, body_h)
 
 
 class ElidingLabel(QLabel):
@@ -204,7 +303,6 @@ class SignalPlot(QWidget):
         self._undo = []
         self._redo = []
         self._wheel_undo_open = False
-        self._gesture = None  # "pan" or "zoom"
         self._drag = None
         self._updating_spins = False
         self._scale_mode = "x"
@@ -236,55 +334,33 @@ class SignalPlot(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(4)
 
-        self._toolbar = FlowHost()
+        self._toolbar = FlowHost(spacing=10)
         flow = self._toolbar.flow
-        self._fit_all_btn = self._button("Fit all", "Fit time and every Y axis to the data", self.fit_all)
-        self._fit_x_btn = self._button("Fit X", "Show the whole log on the time axis", self.fit_x)
-        self._fit_y_btn = self._button("Fit Y", "Fit Y axes to samples inside the current time window", self.fit_y)
-        self._zoom_in_btn = self._button("Zoom +", "Zoom in on the axes selected next to Wheel", lambda: self.zoom_step(ZOOM_IN))
-        self._zoom_out_btn = self._button("Zoom −", "Zoom out on the axes selected next to Wheel", lambda: self.zoom_step(ZOOM_OUT))
-        self._start_btn = self._button("Start", "Scroll to the start of the log without changing the window width", lambda: self.scroll_to_edge(True))
-        self._end_btn = self._button("End", "Scroll to the end of the log without changing the window width", lambda: self.scroll_to_edge(False))
-        self._undo_btn = self._button("Undo", "Undo the last zoom or pan", self.undo)
-        self._redo_btn = self._button("Redo", "Redo the last undone zoom or pan", self.redo)
-        for button in (
-            self._fit_all_btn, self._fit_x_btn, self._fit_y_btn,
-            self._zoom_in_btn, self._zoom_out_btn, self._start_btn, self._end_btn,
-            self._undo_btn, self._redo_btn,
-        ):
-            flow.addWidget(button)
 
-        flow.addWidget(self._gap())
+        view = self._group("View")
+        self._fit_all_btn = view.addWidget(self._button("Fit all", "Fit time and every Y axis to the data", self.fit_all))
+        self._fit_x_btn = view.addWidget(self._button("Fit X", "Show the whole log on the time axis", self.fit_x))
+        self._fit_y_btn = view.addWidget(self._button("Fit Y", "Fit Y axes to samples inside the current time window", self.fit_y))
+        self._zoom_in_btn = view.addWidget(self._button("Zoom +", "Zoom in on the axes selected next to Wheel", lambda: self.zoom_step(ZOOM_IN)))
+        self._zoom_out_btn = view.addWidget(self._button("Zoom −", "Zoom out on the axes selected next to Wheel", lambda: self.zoom_step(ZOOM_OUT)))
+        self._start_btn = view.addWidget(self._button("Start", "Scroll to the start of the log without changing the window width", lambda: self.scroll_to_edge(True)))
+        self._end_btn = view.addWidget(self._button("End", "Scroll to the end of the log without changing the window width", lambda: self.scroll_to_edge(False)))
+        self._undo_btn = view.addWidget(self._button("Undo", "Undo the last zoom or pan", self.undo))
+        self._redo_btn = view.addWidget(self._button("Redo", "Redo the last undone zoom or pan", self.redo))
         self._scale_combo = QComboBox()
         self._scale_combo.addItem("Wheel: X", "x")
         self._scale_combo.addItem("Wheel: Y", "y")
         self._scale_combo.addItem("Wheel: X+Y", "both")
-        self._scale_combo.setToolTip("Which axes the wheel, zoom buttons, pan, and drag-zoom change")
+        self._scale_combo.setToolTip("Which axes the mouse wheel and Zoom buttons change")
         self._scale_combo.setMinimumWidth(118)
+        self._match_control(self._scale_combo)
         self._scale_combo.currentIndexChanged.connect(self._on_scale_mode)
-        flow.addWidget(self._scale_combo)
-        self._pan_btn = self._button("Pan", "Drag the plot. Uses the Wheel axis mode.", self._toggle_pan, checkable=True)
-        self._zoom_btn = self._button("Box", "Drag a rectangle to zoom. Uses the Wheel axis mode.", self._toggle_zoom, checkable=True)
-        self._wheel_btn = self._button("Wheel", "Zoom toward the cursor with the mouse wheel", self._toggle_wheel, checkable=True)
+        view.addWidget(self._scale_combo)
+        self._wheel_btn = view.addWidget(self._button("Wheel", "Zoom toward the cursor with the mouse wheel", self._toggle_wheel, checkable=True))
         self._wheel_btn.setChecked(True)
-        self._gesture_group = QButtonGroup(self)
-        self._gesture_group.setExclusive(False)
-        self._gesture_group.addButton(self._pan_btn)
-        self._gesture_group.addButton(self._zoom_btn)
-        flow.addWidget(self._pan_btn)
-        flow.addWidget(self._zoom_btn)
-        flow.addWidget(self._wheel_btn)
+        flow.addWidget(view)
 
-        flow.addWidget(self._gap())
-        self._cursor_btn = self._button("Cursor", "Show a measurement cursor. Click the plot to place it, then drag the line.", self._toggle_cursor, checkable=True)
-        self._diff_btn = self._button("Δ", "Second cursor. Shift-click to place it. The table shows Δ value.", self._toggle_diff, checkable=True)
-        self._snap_btn = self._button("Snap", "Cursors land on the nearest sample", self._toggle_snap, checkable=True)
-        self._snap_btn.setChecked(True)
-        flow.addWidget(self._cursor_btn)
-        flow.addWidget(self._diff_btn)
-        flow.addWidget(self._snap_btn)
-
-        flow.addWidget(self._gap())
+        layout_group = self._group("Layout")
         self._y_combo = QComboBox()
         self._y_combo.addItem("Stacked plots", "stacked")
         self._y_combo.addItem("Y of selected", "selected")
@@ -295,35 +371,54 @@ class SignalPlot(QWidget):
             "Separate Y axes: one diagram, one scale per signal."
         )
         self._y_combo.setMinimumWidth(140)
+        self._match_control(self._y_combo)
         self._y_combo.currentIndexChanged.connect(self._on_y_mode)
-        flow.addWidget(self._y_combo)
-        self._only_btn = self._button("Current", "Plot only the current signal", self._toggle_only, checkable=True)
-        self._grid_btn = self._button("Grid", "Show or hide the grid", self._toggle_grid, checkable=True)
+        layout_group.addWidget(self._y_combo)
+        self._only_btn = layout_group.addWidget(self._button("Current", "Plot only the current signal", self._toggle_only, checkable=True))
+        self._grid_btn = layout_group.addWidget(self._button("Grid", "Show or hide the grid", self._toggle_grid, checkable=True))
         self._grid_btn.setChecked(True)
-        self._samples_btn = self._button("Samples", "Always draw a marker on every sample. Off: markers appear only when zoomed in.", self._toggle_samples, checkable=True)
-        flow.addWidget(self._only_btn)
-        flow.addWidget(self._grid_btn)
-        flow.addWidget(self._samples_btn)
+        self._samples_btn = layout_group.addWidget(self._button(
+            "Samples",
+            "Always draw a marker on every sample. Off: markers appear only when zoomed in.",
+            self._toggle_samples,
+            checkable=True,
+        ))
+        flow.addWidget(layout_group)
 
-        flow.addWidget(self._gap())
-        flow.addWidget(self._button("PNG", "Save the plot as a PNG", self.export_png))
-        flow.addWidget(self._button("CSV", "Save plotted samples in the cursor span, or the visible time window", self.export_csv))
-
-        flow.addWidget(self._gap())
-        flow.addWidget(QLabel("From"))
+        measure = self._group("Measure")
+        self._cursor_btn = measure.addWidget(self._button(
+            "Cursor",
+            "Show a measurement line. Drag the line to move it, or click the plot to place it.",
+            self._toggle_cursor,
+            checkable=True,
+        ))
+        self._diff_btn = measure.addWidget(self._button(
+            "Δ",
+            "Second measurement line. Shift-click to place it, then drag either line. The table shows Δ value.",
+            self._toggle_diff,
+            checkable=True,
+        ))
+        self._snap_btn = measure.addWidget(self._button("Snap", "Cursors land on the nearest sample when you release them", self._toggle_snap, checkable=True))
+        self._snap_btn.setChecked(True)
+        measure.addWidget(self._caption("From"))
         self.range_from = self._time_spin()
         self.range_to = self._time_spin()
         self.range_from.valueChanged.connect(self._on_range_edited)
         self.range_to.valueChanged.connect(self._on_range_edited)
-        flow.addWidget(self.range_from)
-        flow.addWidget(QLabel("to"))
-        flow.addWidget(self.range_to)
-        flow.addWidget(QLabel("s"))
+        measure.addWidget(self.range_from)
+        measure.addWidget(self._caption("to"))
+        measure.addWidget(self.range_to)
+        measure.addWidget(self._caption("s"))
+        flow.addWidget(measure)
+
+        export = self._group("Export")
+        export.addWidget(self._button("PNG", "Save the plot as a PNG", self.export_png))
+        export.addWidget(self._button("CSV", "Save plotted samples in the cursor span, or the visible time window", self.export_csv))
+        flow.addWidget(export)
         root.addWidget(self._toolbar)
 
         self.readout = QLabel("")
         self.readout.setWordWrap(True)
-        self.readout.setStyleSheet("color: #333;")
         self.readout.setMinimumHeight(18)
         root.addWidget(self.readout)
 
@@ -331,6 +426,11 @@ class SignalPlot(QWidget):
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumHeight(180)
+        self.canvas.setContextMenuPolicy(Qt.NoContextMenu)
+        self.canvas.setToolTip(
+            "Left-drag draws a zoom box. Right-drag pans. "
+            "Drag a measurement line to move it. Shift-click places the difference cursor."
+        )
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.canvas)
         root.addWidget(self.canvas, 1)
 
@@ -340,26 +440,40 @@ class SignalPlot(QWidget):
         button.setCheckable(checkable)
         button.setFocusPolicy(Qt.NoFocus)
         button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        button.setMinimumWidth(_BTN_MIN_WIDTH)
+        button.setFixedHeight(_CTRL_HEIGHT)
         button.setStyleSheet(
-            "QPushButton { padding: 3px 8px; }"
-            "QPushButton:checked { background: #d6e4f5; border: 1px solid #1F4B99; }"
+            "QPushButton { padding: 0 10px; border: 1px solid #ccc; border-radius: 3px;"
+            " background: #fff; color: #222; }"
+            "QPushButton:hover { background: #f2f2f2; }"
+            "QPushButton:checked { background: #d6e4f5; border: 1px solid #1F4B99; color: #1a1a1a; }"
+            "QPushButton:disabled { color: #8a8a8a; background: #f4f4f4; }"
         )
         button.clicked.connect(slot)
         return button
 
-    def _gap(self) -> QWidget:
-        gap = QWidget()
-        gap.setFixedWidth(10)
-        return gap
+    def _group(self, text: str) -> ToolGroup:
+        return ToolGroup(text)
 
-    @staticmethod
-    def _time_spin() -> QDoubleSpinBox:
+    def _caption(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setFixedHeight(_CTRL_HEIGHT)
+        label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        label.setStyleSheet("color: #333; background: transparent;")
+        return label
+
+    def _match_control(self, widget):
+        widget.setFixedHeight(_CTRL_HEIGHT)
+        widget.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+    def _time_spin(self) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
         spin.setRange(0, 1_000_000)
         spin.setDecimals(3)
         spin.setSingleStep(0.1)
         spin.setMaximumWidth(108)
         spin.setKeyboardTracking(False)
+        self._match_control(spin)
         return spin
 
     def resizeEvent(self, event):
@@ -393,8 +507,8 @@ class SignalPlot(QWidget):
         self._autoscale_missing()
         self._rebuild()
 
-    def color_for(self, message: str, signal: str):
-        return self._colors.get(f"{message}\0{signal}")
+    def color_for(self, message: str, signal: str, dbc: str = ""):
+        return self._colors.get(f"{dbc}\0{message}\0{signal}")
 
     def limits(self) -> tuple[float, float]:
         if self._xmin is None or self._xmax is None:
@@ -572,7 +686,7 @@ class SignalPlot(QWidget):
 
     def _build_stacked(self, shown):
         grid = self.figure.subplots(len(shown), 1, sharex=True, squeeze=False)
-        self.figure.subplots_adjust(left=0.1, right=0.98, top=0.97, bottom=0.1, hspace=0.35)
+        self.figure.subplots_adjust(left=0.1, right=0.98, top=0.90, bottom=0.1, hspace=0.35)
         for row, series in enumerate(shown):
             ax = grid[row, 0]
             self._plot_on(ax, series, ylabel=True)
@@ -581,7 +695,7 @@ class SignalPlot(QWidget):
 
     def _build_shared(self, shown):
         ax = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(left=0.1, right=0.98, top=0.97, bottom=0.1)
+        self.figure.subplots_adjust(left=0.1, right=0.98, top=0.90, bottom=0.1)
         for series in shown:
             self._plot_on(ax, series, ylabel=False)
         ax.set_xlabel("Time (s)")
@@ -594,7 +708,7 @@ class SignalPlot(QWidget):
         host = self.figure.add_subplot(111)
         extra = max(0, len(shown) - 1)
         right = max(0.55, 0.97 - 0.08 * extra)
-        self.figure.subplots_adjust(left=0.1, right=right, top=0.97, bottom=0.1)
+        self.figure.subplots_adjust(left=0.1, right=right, top=0.90, bottom=0.1)
         host.set_zorder(0)
         for index, series in enumerate(shown):
             ax = host if index == 0 else host.twinx()
@@ -752,16 +866,18 @@ class SignalPlot(QWidget):
             self._update_readout()
             self.canvas.draw_idle()
             return
-        for ax in self._unique_axes():
+        axes = self._unique_axes()
+        for index, ax in enumerate(axes):
+            top = index == 0
             if self._c1 is not None:
-                self._cursor_lines.append(ax.axvline(self._c1, color=CURSOR_COLOR, lw=1.1, ls="--", zorder=5))
+                self._cursor_lines.extend(self._cursor_artists(ax, self._c1, CURSOR_COLOR, top))
             if self._diff_on and self._c2 is not None:
-                self._diff_lines.append(ax.axvline(self._c2, color=DIFF_COLOR, lw=1.1, ls="--", zorder=5))
+                self._diff_lines.extend(self._cursor_artists(ax, self._c2, DIFF_COLOR, top))
         self._update_readout()
         self.canvas.draw_idle()
 
-    def _place_cursor(self, which: str, t: float):
-        if self._snap_on:
+    def _place_cursor(self, which: str, t: float, snap: bool = False):
+        if snap:
             snapped = self._snap_time(t)
             if snapped is not None:
                 t = snapped
@@ -791,18 +907,47 @@ class SignalPlot(QWidget):
                     best_dist = dist
         return best
 
+    def _cursor_artists(self, ax, t: float, color: str, top: bool):
+        artists = [ax.axvline(t, color=color, lw=2.0, ls="--", zorder=5)]
+        if top:
+            marker, = ax.plot(
+                [t],
+                [1.02],
+                transform=ax.get_xaxis_transform(),
+                marker="v",
+                color=color,
+                markersize=9,
+                clip_on=False,
+                zorder=6,
+            )
+            label = ax.text(
+                t,
+                1.02,
+                f"  {t:.3f} s",
+                transform=ax.get_xaxis_transform(),
+                color=color,
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                clip_on=False,
+                zorder=6,
+            )
+            artists.extend((marker, label))
+        return artists
+
     def _cursor_hit(self, event):
-        if event.inaxes is None or not self._cursor_on:
+        if event.inaxes is None or not self._cursor_on or event.x is None:
             return None
         best = None
-        best_dist = 8
+        best_dist = 18
         for name, lines in (("c1", self._cursor_lines), ("c2", self._diff_lines)):
-            for line in lines:
-                if line.axes is not event.inaxes:
-                    continue
-                xs = line.get_xdata()
-                if len(xs) == 0:
-                    continue
+            for artist in lines:
+                xs = artist.get_xdata() if hasattr(artist, "get_xdata") else None
+                if xs is None or len(xs) == 0:
+                    position = getattr(artist, "get_position", None)
+                    if position is None:
+                        continue
+                    xs = [position()[0]]
                 px, _py = event.inaxes.transData.transform((xs[0], 0))
                 dist = abs(px - event.x)
                 if dist <= best_dist:
@@ -824,35 +969,47 @@ class SignalPlot(QWidget):
         self._apply_limits()
 
     def _on_press(self, event):
-        if event.button != 1 or event.inaxes is None or self._xmin is None:
+        if event.inaxes is None or self._xmin is None or event.xdata is None:
             return
-        if self._gesture == "pan":
-            self._push_undo()
-            self._drag = {"kind": "pan", "x": event.x, "y": event.y, "moved": False, "limits": self._axis_snapshots()}
-            return
-        if self._gesture == "zoom":
-            self._push_undo()
+        if event.button == 1:
+            hit = self._cursor_hit(event)
+            if hit is not None:
+                self._drag = {"kind": hit, "moved": False}
+                self.canvas.setCursor(Qt.SizeHorCursor)
+                return
             origin = self._qt_pos(event)
             self._drag = {
                 "kind": "zoom",
+                "both": True,
                 "ax": event.inaxes,
                 "x0": event.xdata,
                 "y0": event.ydata,
+                "x1": event.xdata,
+                "y1": event.ydata,
                 "origin": origin,
+                "x": event.x,
+                "y": event.y,
+                "xdata": event.xdata,
                 "moved": False,
+                "undo": False,
+                "shift": bool(event.key and "shift" in str(event.key)),
             }
             self._rubber.setGeometry(QRect(origin, QSize()))
             self._rubber.show()
             return
-        hit = self._cursor_hit(event)
-        if hit is not None:
-            self._drag = {"kind": hit, "moved": False}
+        if event.button not in (3, "3"):
             return
-        if self._cursor_on and event.xdata is not None:
-            which = "c2" if (self._diff_on and event.key and "shift" in event.key) else "c1"
-            if which == "c2" and not self._diff_on:
-                which = "c1"
-            self._place_cursor(which, event.xdata)
+        self._drag = {
+            "kind": "pan",
+            "x": event.x,
+            "y": event.y,
+            "xdata": event.xdata,
+            "moved": False,
+            "undo": False,
+            "limits": self._axis_snapshots(),
+            "shift": bool(event.key and "shift" in str(event.key)),
+        }
+        self.canvas.setCursor(Qt.ClosedHandCursor)
 
     def _on_motion(self, event):
         if self._drag is not None and self._drag["kind"] == "pan":
@@ -861,50 +1018,64 @@ class SignalPlot(QWidget):
         if self._drag is not None and self._drag["kind"] == "zoom":
             current = self._qt_pos(event)
             self._rubber.setGeometry(QRect(self._drag["origin"], current).normalized())
-            self._drag["moved"] = True
-            self._drag["x1"] = event.xdata
-            self._drag["y1"] = event.ydata
+            if None not in (event.x, event.y) and abs(event.x - self._drag["x"]) + abs(event.y - self._drag["y"]) > 4:
+                self._drag["moved"] = True
+                if not self._drag["undo"]:
+                    self._push_undo()
+                    self._drag["undo"] = True
+            if event.xdata is not None:
+                self._drag["x1"] = event.xdata
+            if event.ydata is not None:
+                self._drag["y1"] = event.ydata
             return
         if self._drag is not None and self._drag["kind"] in ("c1", "c2") and event.xdata is not None:
             self._drag["moved"] = True
-            self._place_cursor(self._drag["kind"], event.xdata)
+            self._place_cursor(self._drag["kind"], event.xdata, snap=False)
             return
+        self.canvas.setCursor(Qt.SizeHorCursor if self._cursor_hit(event) else Qt.ArrowCursor)
         self._hover(event)
 
     def _on_release(self, _event):
         drag = self._drag
         self._drag = None
         self._rubber.hide()
+        self.canvas.setCursor(Qt.ArrowCursor)
         if drag is None:
             return
         if drag["kind"] == "pan":
-            if not drag["moved"]:
-                self._pop_empty_undo()
-            else:
+            if drag["moved"]:
                 self._store_limits_from_axes()
                 self._apply_limits()
             return
         if drag["kind"] == "zoom":
             if not drag["moved"] or drag.get("x1") is None:
-                self._pop_empty_undo()
+                if self._cursor_on and drag.get("xdata") is not None:
+                    which = "c2" if (self._diff_on and drag.get("shift")) else "c1"
+                    self._place_cursor(which, drag["xdata"], snap=self._snap_on)
                 return
             self._finish_drag_zoom(drag)
+            return
+        if drag["kind"] in ("c1", "c2"):
+            current = self._c1 if drag["kind"] == "c1" else self._c2
+            if current is not None:
+                self._place_cursor(drag["kind"], current, snap=self._snap_on)
 
     def _drag_pan(self, event):
+        if event.x is None or event.y is None:
+            return
         dx = event.x - self._drag["x"]
         dy = event.y - self._drag["y"]
-        if abs(dx) + abs(dy) > 2:
-            self._drag["moved"] = True
-        mode = self._scale_mode
+        if abs(dx) + abs(dy) <= 6:
+            return
+        self._drag["moved"] = True
+        if not self._drag["undo"]:
+            self._push_undo()
+            self._drag["undo"] = True
         for ax, xlim, ylim in self._drag["limits"]:
             x0, y0 = ax.transData.inverted().transform((0, 0))
             x1, y1 = ax.transData.inverted().transform((dx, dy))
-            if mode in ("x", "both"):
-                shift = x1 - x0
-                ax.set_xlim(xlim[0] - shift, xlim[1] - shift)
-            if mode in ("y", "both"):
-                shift = y1 - y0
-                ax.set_ylim(ylim[0] - shift, ylim[1] - shift)
+            ax.set_xlim(xlim[0] - (x1 - x0), xlim[1] - (x1 - x0))
+            ax.set_ylim(ylim[0] - (y1 - y0), ylim[1] - (y1 - y0))
         self._store_limits_from_axes()
         self._style_markers()
         self._write_spins()
@@ -913,7 +1084,7 @@ class SignalPlot(QWidget):
     def _finish_drag_zoom(self, drag):
         x0, x1 = drag["x0"], drag["x1"]
         y0, y1 = drag["y0"], drag["y1"]
-        mode = self._scale_mode
+        mode = "both" if drag.get("both") else self._scale_mode
         changed = False
         if mode in ("x", "both") and None not in (x0, x1) and abs(x1 - x0) > 1e-9:
             self._xmin, self._xmax = (min(x0, x1), max(x0, x1))
@@ -999,18 +1170,6 @@ class SignalPlot(QWidget):
             self._push_undo()
             self._fit_y_limits(self._xmin, self._xmax)
         self._rebuild()
-
-    def _toggle_pan(self):
-        self._set_gesture("pan" if self._pan_btn.isChecked() else None)
-
-    def _toggle_zoom(self):
-        self._set_gesture("zoom" if self._zoom_btn.isChecked() else None)
-
-    def _set_gesture(self, name):
-        self._gesture = name
-        self._pan_btn.setChecked(name == "pan")
-        self._zoom_btn.setChecked(name == "zoom")
-        self._rubber.hide()
 
     def _toggle_wheel(self):
         self._wheel_on = self._wheel_btn.isChecked()
