@@ -1,4 +1,4 @@
-# DBC Viewer
+# CAN Debugger for MacOS
 
 A desktop GUI for working with CAN `.dbc` files: browse message/signal
 structure, compare two `.dbc` files, replay a logged CAN capture against a
