@@ -36,11 +36,14 @@ structure, compare two `.dbc` files, replay a logged CAN capture against a
   it here
 - **Live Signal Viewer tab** — connect to a PEAK PCAN-USB (FD) adapter over
   USB, decode live classic-CAN or CAN-FD traffic against up to five `.dbc`
-  files, and plot selected signals in real time over a scrolling time window.
-  **Add another DBC…** appends a file; if two files share a CAN ID, the one
-  higher in the list is used. Every loaded signal is listed before traffic
-  arrives. Pause freezes the window. The status line counts frames, error
-  frames, and unmapped IDs. CAN-FD bitrate settings sit on their own row
+  files from the Home tab, and plot selected signals in real time over a scrolling time window.
+  The plot toolbar matches Log Replay: View (fit, wheel zoom, follow), Layout
+  (stacked rows with a row-height control), Measure, and Export. Left-drag
+  zooms, right-drag pans, and dragging the gap between stacked rows resizes
+  them. Follow keeps the time axis on the latest Window seconds until you zoom
+  or pan. Every loaded signal is listed before traffic arrives. Pause freezes
+  the window. The status line counts frames, error frames, and unmapped IDs.
+  CAN-FD bitrate settings sit on their own row
 
 The DBC Compare, Log Replay, and Live Signal Viewer tabs all start from
 whatever `.dbc` is currently loaded in the DBC Viewer tab. Log Replay and

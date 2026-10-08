@@ -9,7 +9,8 @@ databases it started with until disconnect. The two things genuinely new
 here: a background QThread (LiveCaptureWorker) receives frames off the GUI
 thread, and the plot is redrawn on a fixed-rate QTimer rather than per
 selection change, since data arrives continuously rather than being decoded
-once.
+once. The plot keeps its zoom, follow state, and row heights across those
+refreshes.
 """
 
 from __future__ import annotations
@@ -19,13 +20,10 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
 from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -56,8 +54,8 @@ from .live_capture_model import (
 from .table_columns import install_column_config
 from .ui_state import remember_splitter
 from .live_capture_worker import LiveCaptureWorker
-from .log_replay_model import enum_ticks
-from .theme import STEEL, set_muted
+from .live_plot import LivePlot
+from .theme import set_muted
 
 SIGNAL_HEADERS = ["DBC", "Message", "Signal", "Unit", "ID (hex)", "Samples"]
 SAMPLES_COL = SIGNAL_HEADERS.index("Samples")
@@ -215,6 +213,9 @@ class LiveSignalViewerTab(QWidget):
         self.window_spin = QSpinBox()
         self.window_spin.setRange(1, 600)
         self.window_spin.setValue(30)
+        self.window_spin.setToolTip(
+            "Seconds kept on the time axis while Follow is on. Older samples are dropped."
+        )
         status_row.addWidget(self.window_spin)
         self.pause_button = QPushButton("Pause")
         self.pause_button.setCheckable(True)
@@ -284,20 +285,8 @@ class LiveSignalViewerTab(QWidget):
         left.setStretchFactor(1, 2)
         splitter.addWidget(left)
 
-        # --- right: plot options + embedded canvas -------------------------
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        self.overlay_checkbox = QCheckBox("Overlay on one plot")
-        self.overlay_checkbox.setChecked(True)
-        right_layout.addWidget(self.overlay_checkbox)
-
-        self.figure = Figure(facecolor="white")
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        right_layout.addWidget(self.toolbar)
-        right_layout.addWidget(self.canvas, 1)
-        splitter.addWidget(right)
+        self.plot = LivePlot()
+        splitter.addWidget(self.plot)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -479,8 +468,8 @@ class LiveSignalViewerTab(QWidget):
         self._error_count = 0
         self._unmapped_count = 0
         self._session_active = True
-        self.figure.clear()
-        self.canvas.draw_idle()
+        self.plot.reset_view()
+        self.plot.show_signals([], None, 0.0, self.window_spin.value())
 
         entries = list(self.library.entries())
         self._capture_entries = entries
@@ -525,6 +514,7 @@ class LiveSignalViewerTab(QWidget):
         self._frame_count = 0
         self._error_count = 0
         self._unmapped_count = 0
+        self.plot.reset_view()
         if self._session_active:
             self._update_status(self._status_prefix())
         self._redraw()
@@ -779,7 +769,7 @@ class LiveSignalViewerTab(QWidget):
 
     def _on_samples_ready(self, samples: list) -> None:
         """Slot for worker.samples_ready. Only mutates buffers/table - never
-        touches self.figure/self.canvas directly; the QTimer-driven _redraw
+        touches the plot figure directly; the QTimer-driven _redraw
         is the sole place that happens, decoupling render rate from the
         rate samples actually arrive at."""
         new_keys = []
@@ -861,105 +851,32 @@ class LiveSignalViewerTab(QWidget):
 
     # --------------------------------------------------------------- plot
 
+    def _current_buffer(self):
+        row = self.signal_table.currentRow()
+        if row < 0:
+            return None
+        item = self.signal_table.item(row, 0)
+        if item is None:
+            return None
+        row_idx = item.data(Qt.UserRole + 1)
+        if row_idx is None or not 0 <= row_idx < len(self._row_keys):
+            return None
+        return self._buffers.get(self._row_keys[row_idx])
+
     def _redraw(self):
-        now = self._paused_now if self._paused else time.monotonic() - self._connect_t0
+        if self._connect_t0:
+            now = self._paused_now if self._paused else time.monotonic() - self._connect_t0
+        else:
+            now = 0.0
         window_s = self.window_spin.value()
-        if not self._paused:
+        if not self._paused and self._connect_t0:
             for buf in self._buffers.values():
                 buf.trim(now, window_s)
         self._update_sample_counts()
         self._refresh_frame_table()
 
         try:
-            self._render_plot(now, window_s)
+            self.plot.show_signals(self._selected_series(), self._current_buffer(), now, window_s)
         except Exception:
-            # figure.clear() runs before the axes are drawn. A failure after
-            # that used to return without draw_idle and leave a white canvas.
             traceback.print_exc()
-            self.figure.clear()
-            self._draw_placeholder("Could not draw plot", now, window_s)
-
-    def _render_plot(self, now: float, window_s: float) -> None:
-        selected = list(self._selected_series())
-        plottable = []
-        for buf in selected:
-            xs, ys = _numeric_points(buf)
-            if xs:
-                plottable.append((buf, xs, ys))
-
-        self.figure.clear()
-        if not plottable:
-            note = "No samples yet" if selected else "Select a signal"
-            self._draw_placeholder(note, now, window_s)
-            return
-
-        overlay = self.overlay_checkbox.isChecked() or len(plottable) == 1
-
-        if overlay:
-            ax = self.figure.add_subplot(111)
-            for buf, xs, ys in plottable:
-                ax.plot(xs, ys, label=buf.display_label)
-                _apply_enum_ticks(ax, buf.choices)
-            ax.set_xlabel("Time (s, since connect)")
-            ax.legend()
-            ax.grid(True)
-            primary = ax
-        else:
-            axes = self.figure.subplots(len(plottable), 1, sharex=True)
-            if len(plottable) == 1:
-                axes = [axes]
-            for ax, (buf, xs, ys) in zip(axes, plottable):
-                ax.plot(xs, ys)
-                ax.set_ylabel(buf.display_label)
-                _apply_enum_ticks(ax, buf.choices)
-                ax.grid(True)
-            axes[-1].set_xlabel("Time (s, since connect)")
-            primary = axes[-1]
-
-        self.figure.tight_layout()
-        if self._paused:
-            primary.set_xlim(self._paused_now - window_s, self._paused_now)
-        self.canvas.draw_idle()
-
-    def _draw_placeholder(self, note: str, now: float, window_s: float) -> None:
-        ax = self.figure.add_subplot(111)
-        ax.set_xlabel("Time (s, since connect)")
-        ax.grid(True)
-        if self._connect_t0 or self._paused:
-            ax.set_xlim(now - window_s, now)
-        ax.text(
-            0.5,
-            0.5,
-            note,
-            transform=ax.transAxes,
-            ha="center",
-            va="center",
-            color=STEEL,
-            fontsize=12,
-        )
-        self.figure.tight_layout()
-        self.canvas.draw_idle()
-
-
-def _numeric_points(buf) -> tuple[list, list]:
-    """Times and numeric values. Non-numeric samples are skipped so one bad value cannot blank the canvas."""
-    xs = []
-    ys = []
-    for t, value in zip(buf.times, buf.values):
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            value = value.value if hasattr(value, "value") else value
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        xs.append(t)
-        ys.append(value)
-    return xs, ys
-
-
-def _apply_enum_ticks(ax, choices) -> None:
-    positions, labels = enum_ticks(choices)
-    if not positions:
-        return
-    if any(isinstance(pos, bool) or not isinstance(pos, (int, float)) for pos in positions):
-        return
-    ax.set_yticks(positions)
-    ax.set_yticklabels(labels)
+            self.plot.show_placeholder("Could not draw plot", now, window_s)
